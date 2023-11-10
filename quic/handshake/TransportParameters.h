@@ -13,6 +13,9 @@
 
 namespace quic {
 
+// macro for repetitive static_cast<uint64_t>(TransportParameterId)
+#define u64_tp(tp_id) static_cast<uint64_t>(tp_id)
+
 enum class TransportParameterId : uint64_t {
   original_destination_connection_id = 0x0000,
   idle_timeout = 0x0001,
@@ -37,7 +40,8 @@ enum class TransportParameterId : uint64_t {
   max_receive_timestamps_per_ack = 0xff0a002,
   receive_timestamps_exponent = 0xff0a003,
   stream_groups_enabled = 0x0000ff99,
-  knob_frames_supported = 0x00005178
+  knob_frames_supported = 0x00005178,
+  cwnd_hint_bytes = 0x00007492
 };
 
 struct TransportParameter {
@@ -58,52 +62,47 @@ struct TransportParameter {
     value = std::move(other.value);
     return *this;
   }
-};
 
-class CustomTransportParameter {
- public:
-  TransportParameterId getParameterId() const;
+  /**
+   * RFC9000:
+   * Each transport parameter is encoded as an (identifier, length, value)
+   * tuple:
+   *
+   *  Transport Parameter {
+   *    Transport Parameter ID (i),
+   *    Transport Parameter Length (i),
+   *    Transport Parameter Value (..),
+   *  }
+   */
 
-  virtual TransportParameter encode() const = 0;
+  // calc size needed to encode TransportParameter on the wire as shown above
+  uint64_t getEncodedSize() const {
+    // varint size of param + varint size of value's length + size of value
+    uint64_t valueLen = value->computeChainDataLength();
+    return getQuicIntegerSize(u64_tp(parameter)).value() +
+        getQuicIntegerSize(valueLen).value() + valueLen;
+  }
 
-  virtual ~CustomTransportParameter() = default;
+  // Encodes TransportParameter as shown above (avoids reallocations)
+  Buf encode() const {
+    // reserve the exact size needed
+    auto res = folly::IOBuf::createCombined(getEncodedSize());
 
- protected:
-  explicit CustomTransportParameter(uint64_t id) : id_(id) {}
+    // write parameter; need to improve QuicInteger encoding methods
+    BufWriter writer(*res, res->capacity());
+    auto appenderOp = [&](auto val) { writer.writeBE(val); };
+    CHECK(encodeQuicInteger(u64_tp(parameter), appenderOp));
 
-  uint64_t id_;
-};
+    // write size of value
+    CHECK(encodeQuicInteger(value->computeChainDataLength(), appenderOp));
 
-class CustomStringTransportParameter : public CustomTransportParameter {
- public:
-  CustomStringTransportParameter(uint64_t id, std::string value);
+    // write value if present
+    if (value) {
+      writer.insert(value.get());
+    }
 
-  TransportParameter encode() const override;
-
- private:
-  std::string value_;
-};
-
-class CustomBlobTransportParameter : public CustomTransportParameter {
- public:
-  CustomBlobTransportParameter(
-      uint64_t id,
-      std::unique_ptr<folly::IOBuf> value);
-
-  TransportParameter encode() const override;
-
- private:
-  std::unique_ptr<folly::IOBuf> value_;
-};
-
-class CustomIntegralTransportParameter : public CustomTransportParameter {
- public:
-  CustomIntegralTransportParameter(uint64_t id, uint64_t value);
-
-  TransportParameter encode() const override;
-
- private:
-  uint64_t value_;
+    return res;
+  }
 };
 
 struct ClientTransportParameters {

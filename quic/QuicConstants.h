@@ -77,9 +77,6 @@ constexpr uint16_t kMaxNumGROBuffers = 64;
 constexpr uint16_t kDefaultNumGROBuffers = kMinNumGROBuffers;
 
 constexpr uint16_t kMaxNumCoalescedPackets = 5;
-// As per version 20 of the spec, transport parameters for private use must
-// have ids with first byte being 0xff.
-constexpr uint16_t kCustomTransportParameterThreshold = 0xff00;
 
 // The length of the integrity tag present in a retry packet.
 constexpr uint32_t kRetryIntegrityTagLen = 16;
@@ -336,13 +333,14 @@ enum class QuicVersion : uint32_t {
   // QuicTransportBase::isKnobSupported() and make sure that knob support is not
   // broken.
   MVFST = 0xfaceb002,
-  QUIC_DRAFT = 0xff00001d, // Draft-29
   QUIC_V1 = 0x00000001,
   QUIC_V1_ALIAS = 0xfaceb003,
   // MVFST_EXPERIMENTAL used to set initial congestion window
   MVFST_EXPERIMENTAL = 0xfaceb00e, // Experimental alias for MVFST
   MVFST_ALIAS = 0xfaceb010,
   MVFST_INVALID = 0xfaceb00f,
+  // MVFST_EXPERIMENTAL2 enables including and using cwnd hints in 0-rtt session
+  // tickets in QuicServerWorker.cpp
   MVFST_EXPERIMENTAL2 = 0xfaceb011, // Experimental alias for MVFST
   MVFST_EXPERIMENTAL3 = 0xfaceb013, // Experimental alias for MVFST
 };
@@ -364,9 +362,6 @@ QuicBatchingMode getQuicBatchingMode(uint32_t val);
 // default QUIC batching size - currently used only
 // by BATCHING_MODE_GSO
 constexpr uint32_t kDefaultQuicMaxBatchSize = 16;
-
-// thread local delay
-constexpr std::chrono::microseconds kDefaultThreadLocalDelay = 1ms;
 
 // rfc6298:
 constexpr int kRttAlpha = 8;
@@ -613,6 +608,10 @@ constexpr uint16_t kMaxDatagramFrameSize = 65535;
 constexpr uint16_t kMaxDatagramPacketOverhead = 25 + 16;
 // The Maximum number of datagrams (in/out) to buffer
 constexpr uint32_t kDefaultMaxDatagramsBuffered = 75;
+
+// Minimum interval between new session tickets sent by the server in
+// milliseconds
+constexpr std::chrono::milliseconds kMinIntervalBetweenSessionTickets = 100ms;
 
 enum class ZeroRttSourceTokenMatchingPolicy : uint8_t {
   REJECT_IF_NO_EXACT_MATCH = 0,

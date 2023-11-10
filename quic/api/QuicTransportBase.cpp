@@ -61,8 +61,10 @@ QuicTransportBase::QuicTransportBase(
     return 0us;
   });
   if (socket_) {
-    socket_->setAdditionalCmsgsFunc(
-        [&]() { return getAdditionalCmsgsForAsyncUDPSocket(); });
+    folly::Function<folly::Optional<folly::SocketCmsgMap>()> func = [&]() {
+      return getAdditionalCmsgsForAsyncUDPSocket();
+    };
+    socket_->setAdditionalCmsgsFunc(std::move(func));
   }
 }
 
@@ -1604,7 +1606,7 @@ void QuicTransportBase::logStreamOpenEvent(StreamId streamId) {
 void QuicTransportBase::handleNewStreams(std::vector<StreamId>& streamStorage) {
   const auto& newPeerStreamIds = streamStorage;
   for (const auto& streamId : newPeerStreamIds) {
-    CHECK_NOTNULL(connCallback_);
+    CHECK_NOTNULL(connCallback_.get());
     if (isBidirectionalStream(streamId)) {
       connCallback_->onNewBidirectionalStream(streamId);
     } else {
@@ -1623,7 +1625,7 @@ void QuicTransportBase::handleNewGroupedStreams(
     std::vector<StreamId>& streamStorage) {
   const auto& newPeerStreamIds = streamStorage;
   for (const auto& streamId : newPeerStreamIds) {
-    CHECK_NOTNULL(connCallback_);
+    CHECK_NOTNULL(connCallback_.get());
     auto stream = CHECK_NOTNULL(conn_->streamManager->getStream(streamId));
     CHECK(stream->groupId);
     if (isBidirectionalStream(streamId)) {
@@ -1871,7 +1873,7 @@ void QuicTransportBase::onNetworkData(
     updateWriteLooper(true);
   };
   try {
-    conn_->lossState.totalBytesRecvd += networkData.totalData;
+    conn_->lossState.totalBytesRecvd += networkData.getTotalData();
     auto originalAckVersion = currentAckStateVersion(*conn_);
 
     // handle PacketsReceivedEvent if requested by observers
@@ -1881,13 +1883,13 @@ void QuicTransportBase::onNetworkData(
                 SocketObserverInterface::Events::packetsReceivedEvents>()) {
       auto builder = SocketObserverInterface::PacketsReceivedEvent::Builder()
                          .setReceiveLoopTime(TimePoint::clock::now())
-                         .setNumPacketsReceived(networkData.packets.size())
-                         .setNumBytesReceived(networkData.totalData);
-      for (auto& packet : networkData.packets) {
+                         .setNumPacketsReceived(networkData.getPackets().size())
+                         .setNumBytesReceived(networkData.getTotalData());
+      for (auto& packet : networkData.getPackets()) {
         builder.addReceivedPacket(
             SocketObserverInterface::PacketsReceivedEvent::ReceivedPacket::
                 Builder()
-                    .setPacketReceiveTime(networkData.receiveTimePoint)
+                    .setPacketReceiveTime(packet.timings.receiveTimePoint)
                     .setPacketNumBytes(packet.buf->computeChainDataLength())
                     .build());
       }
@@ -1901,12 +1903,9 @@ void QuicTransportBase::onNetworkData(
               });
     }
 
-    for (auto& packet : networkData.packets) {
-      onReadData(
-          peer,
-          NetworkDataSingle(
-              ReceivedPacket(std::move(packet.buf)),
-              networkData.receiveTimePoint));
+    auto packets = std::move(networkData).movePackets();
+    for (auto& packet : packets) {
+      onReadData(peer, std::move(packet));
       if (conn_->peerConnectionError) {
         closeImpl(QuicError(
             QuicErrorCode(TransportErrorCode::NO_ERROR), "Peer closed"));
@@ -2843,11 +2842,12 @@ void QuicTransportBase::setAckRxTimestampsDisabled(
 }
 
 void QuicTransportBase::setConnectionSetupCallback(
-    ConnectionSetupCallback* callback) {
+    folly::MaybeManagedPtr<ConnectionSetupCallback> callback) {
   connSetupCallback_ = callback;
 }
 
-void QuicTransportBase::setConnectionCallback(ConnectionCallback* callback) {
+void QuicTransportBase::setConnectionCallback(
+    folly::MaybeManagedPtr<ConnectionCallback> callback) {
   connCallback_ = callback;
 }
 

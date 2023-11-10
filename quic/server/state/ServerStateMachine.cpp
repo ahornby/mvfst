@@ -231,8 +231,7 @@ void processClientInitialParams(
   auto receiveTimestampsExponent = getIntegerParameter(
       TransportParameterId::receive_timestamps_exponent,
       clientParams.parameters);
-  if (conn.version == QuicVersion::QUIC_DRAFT ||
-      conn.version == QuicVersion::QUIC_V1 ||
+  if (conn.version == QuicVersion::QUIC_V1 ||
       conn.version == QuicVersion::QUIC_V1_ALIAS) {
     auto initialSourceConnId = getConnIdParameter(
         TransportParameterId::initial_source_connection_id,
@@ -545,7 +544,8 @@ void updateTransportParamsFromTicket(
     uint64_t initialMaxStreamDataBidiRemote,
     uint64_t initialMaxStreamDataUni,
     uint64_t initialMaxStreamsBidi,
-    uint64_t initialMaxStreamsUni) {
+    uint64_t initialMaxStreamsUni,
+    folly::Optional<uint64_t> maybeCwndHintBytes) {
   conn.transportSettings.idleTimeout = std::chrono::milliseconds(idleTimeout);
   conn.transportSettings.maxRecvPacketSize = maxRecvPacketSize;
 
@@ -563,6 +563,12 @@ void updateTransportParamsFromTicket(
   conn.transportSettings.advertisedInitialMaxStreamsBidi =
       initialMaxStreamsBidi;
   conn.transportSettings.advertisedInitialMaxStreamsUni = initialMaxStreamsUni;
+
+  conn.maybeCwndHintBytes = maybeCwndHintBytes;
+
+  if (maybeCwndHintBytes) {
+    QUIC_STATS(conn.statsCallback, onCwndHintBytesSample, *maybeCwndHintBytes);
+  }
 }
 
 void onConnectionMigration(
@@ -706,9 +712,8 @@ static void handleCipherUnavailable(
         PacketDropReason::PARSE_ERROR_PACKET_BUFFERED);
     ServerEvents::ReadData pendingReadData;
     pendingReadData.peer = readData.peer;
-    pendingReadData.networkData = NetworkDataSingle(
-        ReceivedPacket(std::move(originalData->packet)),
-        readData.networkData.receiveTimePoint);
+    pendingReadData.udpPacket = ReceivedPacket(
+        std::move(originalData->packet), readData.udpPacket.timings);
     pendingData->emplace_back(std::move(pendingReadData));
     VLOG(10) << "Adding pending data to "
              << toString(originalData->protectionType)
@@ -732,15 +737,15 @@ void onServerReadDataFromOpen(
     ServerEvents::ReadData& readData) {
   CHECK_EQ(conn.state, ServerState::Open);
   // Don't bother parsing if the data is empty.
-  if (!readData.networkData.packet.buf ||
-      readData.networkData.packet.buf->computeChainDataLength() == 0) {
+  if (!readData.udpPacket.buf ||
+      readData.udpPacket.buf->computeChainDataLength() == 0) {
     return;
   }
   bool firstPacketFromPeer = false;
   if (!conn.readCodec) {
     firstPacketFromPeer = true;
 
-    folly::io::Cursor cursor(readData.networkData.packet.buf.get());
+    folly::io::Cursor cursor(readData.udpPacket.buf.get());
     auto initialByte = cursor.readBE<uint8_t>();
     auto parsedLongHeader = parseLongHeaderInvariant(initialByte, cursor);
     if (!parsedLongHeader) {
@@ -849,7 +854,7 @@ void onServerReadDataFromOpen(
     conn.peerAddress = conn.originalPeerAddress;
   }
   BufQueue udpData;
-  udpData.append(std::move(readData.networkData.packet.buf));
+  udpData.append(std::move(readData.udpPacket.buf));
   for (uint16_t processedPackets = 0;
        !udpData.empty() && processedPackets < kMaxNumCoalescedPackets;
        processedPackets++) {
@@ -1015,7 +1020,7 @@ void onServerReadDataFromOpen(
 
     auto& ackState = getAckState(conn, packetNumberSpace);
     uint64_t distanceFromExpectedPacketNum = updateLargestReceivedPacketNum(
-        conn, ackState, packetNum, readData.networkData.receiveTimePoint);
+        conn, ackState, packetNum, readData.udpPacket.timings.receiveTimePoint);
     if (distanceFromExpectedPacketNum > 0) {
       QUIC_STATS(conn.statsCallback, onOutOfOrderPacketReceived);
     }
@@ -1103,7 +1108,7 @@ void onServerReadDataFromOpen(
                 }
               },
               markPacketLoss,
-              readData.networkData.receiveTimePoint));
+              readData.udpPacket.timings.receiveTimePoint));
           break;
         }
         case QuicFrame::Type::RstStreamFrame: {
@@ -1261,7 +1266,8 @@ void onServerReadDataFromOpen(
           // Datagram isn't retransmittable. But we would like to ack them
           // early. So, make Datagram frames count towards ack policy
           pktHasRetransmittableData = true;
-          handleDatagram(conn, frame, readData.networkData.receiveTimePoint);
+          handleDatagram(
+              conn, frame, readData.udpPacket.timings.receiveTimePoint);
           break;
         }
         case QuicFrame::Type::ImmediateAckFrame: {
@@ -1378,7 +1384,7 @@ void onServerReadDataFromClosed(
     ServerEvents::ReadData& readData) {
   CHECK_EQ(conn.state, ServerState::Closed);
   BufQueue udpData;
-  udpData.append(std::move(readData.networkData.packet.buf));
+  udpData.append(std::move(readData.udpPacket.buf));
   auto packetSize = udpData.empty() ? 0 : udpData.chainLength();
   if (!conn.readCodec) {
     // drop data. We closed before we even got the first packet. This is
@@ -1570,61 +1576,46 @@ QuicServerConnectionState::createAndAddNewSelfConnId() {
 
 std::vector<TransportParameter> setSupportedExtensionTransportParameters(
     QuicServerConnectionState& conn) {
-  std::vector<TransportParameter> customTransportParams;
+  using TpId = TransportParameterId;
+  std::vector<TransportParameter> customTps;
   const auto& ts = conn.transportSettings;
+
   if (ts.datagramConfig.enabled) {
-    CustomIntegralTransportParameter maxDatagramFrameSize(
-        static_cast<uint64_t>(TransportParameterId::max_datagram_frame_size),
-        conn.datagramState.maxReadFrameSize);
-    customTransportParams.push_back(maxDatagramFrameSize.encode());
+    customTps.push_back(encodeIntegerParameter(
+        TransportParameterId::max_datagram_frame_size,
+        conn.datagramState.maxReadFrameSize));
   }
 
   if (ts.advertisedMaxStreamGroups > 0) {
-    CustomIntegralTransportParameter streamGroupsEnabledParam(
-        static_cast<uint64_t>(TransportParameterId::stream_groups_enabled),
-        ts.advertisedMaxStreamGroups);
-
-    if (!setCustomTransportParameter(
-            streamGroupsEnabledParam, customTransportParams)) {
-      LOG(ERROR) << "failed to set stream groups enabled transport parameter";
-    }
+    customTps.push_back(encodeIntegerParameter(
+        TpId::stream_groups_enabled, ts.advertisedMaxStreamGroups));
   }
 
-  CustomIntegralTransportParameter ackReceiveTimestampsEnabled(
-      static_cast<uint64_t>(
-          TransportParameterId::ack_receive_timestamps_enabled),
-      ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value() ? 1 : 0);
-  customTransportParams.push_back(ackReceiveTimestampsEnabled.encode());
+  customTps.push_back(encodeIntegerParameter(
+      TpId::ack_receive_timestamps_enabled,
+      ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value() ? 1 : 0));
 
   if (ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value()) {
-    CustomIntegralTransportParameter maxReceiveTimestampsPerAck(
-        static_cast<uint64_t>(
-            TransportParameterId::max_receive_timestamps_per_ack),
+    customTps.push_back(encodeIntegerParameter(
+        TpId::max_receive_timestamps_per_ack,
         ts.maybeAckReceiveTimestampsConfigSentToPeer
-            ->maxReceiveTimestampsPerAck);
-    customTransportParams.push_back(maxReceiveTimestampsPerAck.encode());
+            ->maxReceiveTimestampsPerAck));
 
-    CustomIntegralTransportParameter receiveTimestampsExponent(
-        static_cast<uint64_t>(
-            TransportParameterId::receive_timestamps_exponent),
+    customTps.push_back(encodeIntegerParameter(
+        TpId::receive_timestamps_exponent,
         ts.maybeAckReceiveTimestampsConfigSentToPeer
-            ->receiveTimestampsExponent);
-    customTransportParams.push_back(receiveTimestampsExponent.encode());
+            ->receiveTimestampsExponent));
   }
 
   if (ts.minAckDelay) {
-    CustomIntegralTransportParameter minAckDelay(
-        static_cast<uint64_t>(TransportParameterId::min_ack_delay),
-        ts.minAckDelay.value().count());
-    customTransportParams.push_back(minAckDelay.encode());
+    customTps.push_back(encodeIntegerParameter(
+        TpId::min_ack_delay, ts.minAckDelay.value().count()));
   }
 
   if (ts.advertisedKnobFrameSupport) {
-    CustomIntegralTransportParameter knobFrameSupport(
-        static_cast<uint64_t>(TransportParameterId::knob_frames_supported), 1);
-    customTransportParams.push_back(knobFrameSupport.encode());
+    customTps.push_back(encodeIntegerParameter(TpId::knob_frames_supported, 1));
   }
 
-  return customTransportParams;
+  return customTps;
 }
 } // namespace quic

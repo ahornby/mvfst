@@ -44,9 +44,9 @@ namespace quic {
 namespace test {
 
 MATCHER_P(NetworkDataMatches, networkData, "") {
-  for (size_t i = 0; i < arg.packets.size(); ++i) {
+  for (size_t i = 0; i < arg.getPackets().size(); ++i) {
     folly::IOBufEqualTo eq;
-    bool equals = eq(*arg.packets[i].buf, networkData);
+    bool equals = eq(*arg.getPackets()[i].buf, networkData);
     if (equals) {
       return true;
     }
@@ -1969,8 +1969,8 @@ TEST_F(QuicServerWorkerTakeoverTest, QuicServerTakeoverProcessForwardedPkt) {
           EXPECT_EQ(addr.getPort(), clientAddr.getPort());
           // the original data should be extracted after processing takeover
           // protocol related information
-          EXPECT_EQ(networkData->packets.size(), 1);
-          EXPECT_TRUE(eq(*data, *(networkData->packets[0].buf)));
+          EXPECT_EQ(networkData->getPackets().size(), 1);
+          EXPECT_TRUE(eq(*data, *(networkData->getPackets()[0].buf)));
           EXPECT_TRUE(isForwardedData);
         };
         EXPECT_CALL(*takeoverWorkerCb_, routeDataToWorkerLong(_, _, _, _, _))
@@ -2161,9 +2161,9 @@ class QuicServerTest : public Test {
               .WillByDefault(Invoke(
                   [&, expected = std::shared_ptr<folly::IOBuf>(data->clone())](
                       auto, const auto& networkData) mutable {
-                    EXPECT_GT(networkData.packets.size(), 0);
+                    EXPECT_GT(networkData.getPackets().size(), 0);
                     EXPECT_TRUE(folly::IOBufEqualTo()(
-                        *networkData.packets[0].buf, *expected));
+                        *networkData.getPackets()[0].buf, *expected));
                     std::unique_lock<std::mutex> lg(m);
                     calledOnNetworkData = true;
                     cv.notify_one();
@@ -2322,9 +2322,9 @@ TEST_F(QuicServerTest, RouteDataFromDifferentThread) {
 
   EXPECT_CALL(*transport, onNetworkData(_, _))
       .WillOnce(Invoke([&](auto, const auto& networkData) {
-        EXPECT_GT(networkData.packets.size(), 0);
-        EXPECT_TRUE(
-            folly::IOBufEqualTo()(*networkData.packets[0].buf, *initialData));
+        EXPECT_GT(networkData.getPackets().size(), 0);
+        EXPECT_TRUE(folly::IOBufEqualTo()(
+            *networkData.getPackets()[0].buf, *initialData));
       }));
 
   server_->routeDataToWorker(
@@ -2422,9 +2422,9 @@ class QuicServerTakeoverTest : public Test {
           EXPECT_CALL(*transport, onNetworkData(_, _))
               .WillOnce(Invoke(
                   [&, expected = data.get()](auto, const auto& networkData) {
-                    EXPECT_GT(networkData.packets.size(), 0);
+                    EXPECT_GT(networkData.getPackets().size(), 0);
                     EXPECT_TRUE(folly::IOBufEqualTo()(
-                        *networkData.packets[0].buf, *expected));
+                        *networkData.getPackets()[0].buf, *expected));
                     baton.post();
                   }));
           return transport;
@@ -2530,9 +2530,9 @@ class QuicServerTakeoverTest : public Test {
     EXPECT_CALL(*transportCbForOldServer, onNetworkData(_, _))
         .WillOnce(
             Invoke([&, expected = data.get()](auto, const auto& networkData) {
-              EXPECT_GT(networkData.packets.size(), 0);
+              EXPECT_GT(networkData.getPackets().size(), 0);
               EXPECT_TRUE(folly::IOBufEqualTo()(
-                  *networkData.packets[0].buf, *expected));
+                  *networkData.getPackets()[0].buf, *expected));
               b1.post();
             }));
     // new quic server receives the packet and forwards it
@@ -2993,9 +2993,9 @@ TEST_F(QuicServerTest, ZeroRttPacketRoute) {
         EXPECT_CALL(*transport, onNetworkData(_, _))
             .WillOnce(Invoke(
                 [&, expected = data.get()](auto, const auto& networkData) {
-                  EXPECT_GT(networkData.packets.size(), 0);
+                  EXPECT_GT(networkData.getPackets().size(), 0);
                   EXPECT_TRUE(folly::IOBufEqualTo()(
-                      *networkData.packets[0].buf, *expected));
+                      *networkData.getPackets()[0].buf, *expected));
                   b.post();
                 }));
         return transport;
@@ -3036,9 +3036,9 @@ TEST_F(QuicServerTest, ZeroRttPacketRoute) {
   folly::Baton<> b1;
   auto verifyZeroRtt = [&](const folly::SocketAddress& peer,
                            const NetworkData& networkData) noexcept {
-    EXPECT_GT(networkData.packets.size(), 0);
+    EXPECT_GT(networkData.getPackets().size(), 0);
     EXPECT_EQ(peer, reader->getSocket().address());
-    EXPECT_TRUE(folly::IOBufEqualTo()(*data, *networkData.packets[0].buf));
+    EXPECT_TRUE(folly::IOBufEqualTo()(*data, *networkData.getPackets()[0].buf));
     b1.post();
   };
   EXPECT_CALL(*transport, onNetworkData(_, _)).WillOnce(Invoke(verifyZeroRtt));
@@ -3089,7 +3089,7 @@ TEST_F(QuicServerTest, ZeroRttBeforeInitial) {
         EXPECT_CALL(*transport, onNetworkData(_, _))
             .Times(2)
             .WillRepeatedly(Invoke([&](auto, auto& networkData) {
-              for (auto& packet : networkData.packets) {
+              for (const auto& packet : networkData.getPackets()) {
                 receivedData.emplace_back(packet.buf->clone());
               }
               if (receivedData.size() == 2) {
@@ -3155,197 +3155,5 @@ TEST_F(QuicServerTest, OneEVB) {
   evb.loop();
 }
 
-/**
- * used for testing / observer transport parameters advertised by the server
- */
-class MockMergedConnectionCallbacks : public MockConnectionSetupCallback,
-                                      public MockConnectionCallback {};
-
-class QuicTransportFactory : public quic::QuicServerTransportFactory {
-  // no-op quic server transport factory
-  quic::QuicServerTransport::Ptr make(
-      folly::EventBase* evb,
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
-      const folly::SocketAddress& /* peerAddr */,
-      quic::QuicVersion /*quicVersion*/,
-      std::shared_ptr<const fizz::server::FizzServerContext> ctx) noexcept
-      override {
-    // delete mocked object as soon as terminal callback is rx'd
-    auto noopCb = new MockMergedConnectionCallbacks();
-    EXPECT_CALL(*noopCb, onConnectionEnd())
-        .Times(AtMost(1))
-        .WillRepeatedly([noopCb] { delete noopCb; });
-    EXPECT_CALL(*noopCb, onConnectionError(_))
-        .Times(AtMost(1))
-        .WillRepeatedly([noopCb] { delete noopCb; });
-    return quic::QuicServerTransport::make(
-        evb, std::move(socket), noopCb, noopCb, ctx);
-  }
-};
-
-class ServerTransportParameters : public testing::Test {
- public:
-  void TearDown() override {
-    if (client_) {
-      client_->close(folly::none);
-    }
-    evb_.loop();
-  }
-
-  void clientConnect() {
-    CHECK(client_) << "client not initialized";
-    MockConnectionSetupCallback setupCb;
-    MockConnectionCallback connCb;
-    EXPECT_CALL(setupCb, onReplaySafe()).WillOnce(Invoke([&] {
-      evb_.terminateLoopSoon();
-    }));
-    client_->start(&setupCb, &connCb);
-
-    evb_.loopForever();
-  }
-
-  // start server with the transport settings that unit test can set accordingly
-  void startServer() {
-    server_ = QuicServer::createQuicServer();
-    // set server configs
-    server_->setFizzContext(quic::test::createServerCtx());
-    serverTs_.statelessResetTokenSecret = getRandSecret();
-    server_->setTransportSettings(serverTs_);
-    server_->setQuicServerTransportFactory(
-        std::make_unique<QuicTransportFactory>());
-    // start server
-    server_->start(folly::SocketAddress("::1", 0), 1);
-    server_->waitUntilInitialized();
-  }
-
-  // create new quic client
-  std::shared_ptr<QuicClientTransport> createQuicClient() {
-    // server must be already started
-    CHECK(server_)
-        << "::startServer() must be invoked prior to ::createQuicClient()";
-    auto fizzClientContext =
-        FizzClientQuicHandshakeContext::Builder()
-            .setCertificateVerifier(createTestCertificateVerifier())
-            .build();
-    auto client = std::make_shared<QuicClientTransport>(
-        &evb_,
-        std::make_unique<QuicAsyncUDPSocketWrapperImpl>(&evb_),
-        std::move(fizzClientContext));
-    client->addNewPeerAddress(server_->getAddress());
-    client->setHostname("::1");
-    client->setSupportedVersions({QuicVersion::MVFST});
-    return client;
-  }
-
-  std::shared_ptr<QuicClientTransport> client_;
-  std::shared_ptr<QuicServer> server_;
-  TransportSettings serverTs_{};
-  folly::EventBase evb_;
-};
-
-TEST_F(ServerTransportParameters, InvariantlyAdvertisedParameters) {
-  startServer();
-
-  // create & connect client
-  client_ = createQuicClient();
-  clientConnect();
-
-  // validate all the parameters we unconditionally advertise
-  auto clientConn =
-      dynamic_cast<const QuicClientConnectionState*>(client_->getState());
-  const auto& serverTransportParams =
-      clientConn->clientHandshakeLayer->getServerTransportParams();
-  CHECK(serverTransportParams.has_value());
-
-  using _id = TransportParameterId;
-  for (auto paramId :
-       {_id::initial_max_stream_data_bidi_local,
-        _id::initial_max_stream_data_bidi_remote,
-        _id::initial_max_stream_data_uni,
-        _id::initial_max_data,
-        _id::initial_max_streams_bidi,
-        _id::initial_max_streams_uni,
-        _id::idle_timeout,
-        _id::ack_delay_exponent,
-        _id::max_packet_size,
-        _id::stateless_reset_token}) {
-    auto param =
-        getIntegerParameter(paramId, serverTransportParams->parameters);
-    EXPECT_TRUE(param.has_value());
-  }
-
-  client_.reset();
-}
-
-TEST_F(ServerTransportParameters, DatagramTest) {
-  // turn off datagram support to begin with
-  serverTs_.datagramConfig.enabled = false;
-  startServer();
-
-  {
-    // create & connect client
-    client_ = createQuicClient();
-    clientConnect();
-
-    // validate no datagram support was advertised by server
-    auto clientConn =
-        dynamic_cast<const QuicClientConnectionState*>(client_->getState());
-    const auto& serverTransportParams =
-        clientConn->clientHandshakeLayer->getServerTransportParams();
-    CHECK(serverTransportParams.has_value());
-
-    auto param = getIntegerParameter(
-        TransportParameterId::max_datagram_frame_size,
-        serverTransportParams->parameters);
-    EXPECT_FALSE(param.has_value());
-    client_.reset();
-  }
-
-  {
-    // now enable datagram support
-    serverTs_.datagramConfig.enabled = true;
-    server_->setTransportSettings(serverTs_);
-
-    // create & connect client
-    client_ = createQuicClient();
-    clientConnect();
-
-    // validate datagram support was advertised by server
-    auto clientConn =
-        dynamic_cast<const QuicClientConnectionState*>(client_->getState());
-    const auto& serverTransportParams =
-        clientConn->clientHandshakeLayer->getServerTransportParams();
-    CHECK(serverTransportParams.has_value());
-
-    auto param = getIntegerParameter(
-        TransportParameterId::max_datagram_frame_size,
-        serverTransportParams->parameters);
-    CHECK(param.has_value());
-    // also validate value because why not
-    EXPECT_EQ(param.value(), kMaxDatagramFrameSize);
-  }
-}
-
-TEST_F(ServerTransportParameters, disableMigrationParam) {
-  // turn off migration
-  serverTs_.disableMigration = true;
-  startServer();
-
-  // create & connect client
-  client_ = createQuicClient();
-  clientConnect();
-  auto clientConn =
-      dynamic_cast<const QuicClientConnectionState*>(client_->getState());
-
-  const auto& serverTransportParams =
-      clientConn->clientHandshakeLayer->getServerTransportParams();
-  CHECK(serverTransportParams.has_value());
-
-  // validate disable_migration parameter was rx'd
-  auto it = findParameter(
-      serverTransportParams->parameters,
-      TransportParameterId::disable_migration);
-  EXPECT_NE(it, serverTransportParams->parameters.end());
-}
 } // namespace test
 } // namespace quic

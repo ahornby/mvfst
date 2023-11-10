@@ -10,6 +10,7 @@
 #include <quic/common/BufUtil.h>
 
 namespace quic {
+
 folly::Optional<uint64_t> getIntegerParameter(
     TransportParameterId id,
     const std::vector<TransportParameter>& parameters) {
@@ -22,8 +23,7 @@ folly::Optional<uint64_t> getIntegerParameter(
   if (!parameter) {
     throw QuicTransportException(
         folly::to<std::string>(
-            "Failed to decode integer from TransportParameterId: ",
-            static_cast<uint64_t>(id)),
+            "Failed to decode integer from TransportParameterId: ", u64_tp(id)),
         TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
   }
   return parameter->first;
@@ -78,38 +78,6 @@ TransportParameter encodeIntegerParameter(
         TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
   }
   return {id, std::move(data)};
-}
-
-TransportParameterId CustomTransportParameter::getParameterId() const {
-  return static_cast<TransportParameterId>(id_);
-}
-
-CustomStringTransportParameter::CustomStringTransportParameter(
-    uint64_t id,
-    std::string value)
-    : CustomTransportParameter(id), value_(value) {}
-
-TransportParameter CustomStringTransportParameter::encode() const {
-  return {
-      static_cast<TransportParameterId>(id_), folly::IOBuf::copyBuffer(value_)};
-}
-
-CustomBlobTransportParameter::CustomBlobTransportParameter(
-    uint64_t id,
-    std::unique_ptr<folly::IOBuf> value)
-    : CustomTransportParameter(id), value_(std::move(value)) {}
-
-TransportParameter CustomBlobTransportParameter::encode() const {
-  return {static_cast<TransportParameterId>(id_), value_->clone()};
-}
-
-CustomIntegralTransportParameter::CustomIntegralTransportParameter(
-    uint64_t id,
-    uint64_t value)
-    : CustomTransportParameter(id), value_(value) {}
-
-TransportParameter CustomIntegralTransportParameter::encode() const {
-  return encodeIntegerParameter(static_cast<TransportParameterId>(id_), value_);
 }
 
 } // namespace quic

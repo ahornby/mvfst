@@ -118,48 +118,49 @@ QuicClientTransport::~QuicClientTransport() {
   }
 }
 
-void QuicClientTransport::processUDPData(
+void QuicClientTransport::processUdpPacket(
     const folly::SocketAddress& peer,
-    NetworkDataSingle&& networkData) {
-  BufQueue udpData;
-  udpData.append(std::move(networkData.packet.buf));
+    ReceivedPacket&& udpPacket) {
+  // Process the arriving UDP packet, which may have coalesced QUIC packets.
+  {
+    BufQueue udpData;
+    udpData.append(std::move(udpPacket.buf));
 
-  if (!conn_->version) {
-    // We only check for version negotiation packets before the version
-    // is negotiated.
-    auto versionNegotiation =
-        conn_->readCodec->tryParsingVersionNegotiation(udpData);
-    if (versionNegotiation) {
-      VLOG(4) << "Got version negotiation packet from peer=" << peer
-              << " versions=" << std::hex << versionNegotiation->versions << " "
-              << *this;
+    if (!conn_->version) {
+      // We only check for version negotiation packets before the version
+      // is negotiated.
+      auto versionNegotiation =
+          conn_->readCodec->tryParsingVersionNegotiation(udpData);
+      if (versionNegotiation) {
+        VLOG(4) << "Got version negotiation packet from peer=" << peer
+                << " versions=" << std::hex << versionNegotiation->versions
+                << " " << *this;
 
-      throw QuicInternalException(
-          "Received version negotiation packet",
-          LocalErrorCode::CONNECTION_ABANDONED);
+        throw QuicInternalException(
+            "Received version negotiation packet",
+            LocalErrorCode::CONNECTION_ABANDONED);
+      }
     }
+
+    for (uint16_t processedPackets = 0;
+         !udpData.empty() && processedPackets < kMaxNumCoalescedPackets;
+         processedPackets++) {
+      processUdpPacketData(peer, udpPacket.timings, udpData);
+    }
+    VLOG_IF(4, !udpData.empty())
+        << "Leaving " << udpData.chainLength()
+        << " bytes unprocessed after attempting to process "
+        << kMaxNumCoalescedPackets << " packets.";
   }
 
-  for (uint16_t processedPackets = 0;
-       !udpData.empty() && processedPackets < kMaxNumCoalescedPackets;
-       processedPackets++) {
-    processPacketData(peer, networkData.receiveTimePoint, udpData);
-  }
-  VLOG_IF(4, !udpData.empty())
-      << "Leaving " << udpData.chainLength()
-      << " bytes unprocessed after attempting to process "
-      << kMaxNumCoalescedPackets << " packets.";
-
-  // Process any pending 1RTT and handshake packets if we have keys.
+  // Process any deferred pending 1RTT and handshake packets if we have keys.
   if (conn_->readCodec->getOneRttReadCipher() &&
       !clientConn_->pendingOneRttData.empty()) {
     BufQueue pendingPacket;
     for (auto& pendingData : clientConn_->pendingOneRttData) {
-      pendingPacket.append(std::move(pendingData.networkData.packet.buf));
-      processPacketData(
-          pendingData.peer,
-          pendingData.networkData.receiveTimePoint,
-          pendingPacket);
+      pendingPacket.append(std::move(pendingData.udpPacket.buf));
+      processUdpPacketData(
+          pendingData.peer, pendingData.udpPacket.timings, pendingPacket);
       pendingPacket.move();
     }
     clientConn_->pendingOneRttData.clear();
@@ -168,27 +169,25 @@ void QuicClientTransport::processUDPData(
       !clientConn_->pendingHandshakeData.empty()) {
     BufQueue pendingPacket;
     for (auto& pendingData : clientConn_->pendingHandshakeData) {
-      pendingPacket.append(std::move(pendingData.networkData.packet.buf));
-      processPacketData(
-          pendingData.peer,
-          pendingData.networkData.receiveTimePoint,
-          pendingPacket);
+      pendingPacket.append(std::move(pendingData.udpPacket.buf));
+      processUdpPacketData(
+          pendingData.peer, pendingData.udpPacket.timings, pendingPacket);
       pendingPacket.move();
     }
     clientConn_->pendingHandshakeData.clear();
   }
 }
 
-void QuicClientTransport::processPacketData(
+void QuicClientTransport::processUdpPacketData(
     const folly::SocketAddress& peer,
-    TimePoint receiveTimePoint,
-    BufQueue& packetQueue) {
-  auto packetSize = packetQueue.chainLength();
+    const ReceivedPacket::Timings& udpPacketTimings,
+    BufQueue& udpPacketData) {
+  auto packetSize = udpPacketData.chainLength();
   if (packetSize == 0) {
     return;
   }
   auto parsedPacket = conn_->readCodec->parsePacket(
-      packetQueue, conn_->ackStates, conn_->clientConnectionId->size());
+      udpPacketData, conn_->ackStates, conn_->clientConnectionId->size());
   StatelessReset* statelessReset = parsedPacket.statelessReset();
   if (statelessReset) {
     const auto& token = clientConn_->statelessResetToken;
@@ -269,9 +268,7 @@ void QuicClientTransport::processPacketData(
         ? clientConn_->pendingOneRttData
         : clientConn_->pendingHandshakeData;
     pendingData.emplace_back(
-        NetworkDataSingle(
-            ReceivedPacket(std::move(cipherUnavailable->packet)),
-            receiveTimePoint),
+        ReceivedPacket(std::move(cipherUnavailable->packet), udpPacketTimings),
         peer);
     if (conn_->qLogger) {
       conn_->qLogger->addPacketBuffered(
@@ -372,7 +369,7 @@ void QuicClientTransport::processPacketData(
   }
   auto& ackState = getAckState(*conn_, pnSpace);
   uint64_t distanceFromExpectedPacketNum = updateLargestReceivedPacketNum(
-      *conn_, ackState, packetNum, receiveTimePoint);
+      *conn_, ackState, packetNum, udpPacketTimings.receiveTimePoint);
   if (distanceFromExpectedPacketNum > 0) {
     QUIC_STATS(conn_->statsCallback, onOutOfOrderPacketReceived);
   }
@@ -461,7 +458,7 @@ void QuicClientTransport::processPacketData(
               }
             },
             markPacketLoss,
-            receiveTimePoint));
+            udpPacketTimings.receiveTimePoint));
         break;
       }
       case QuicFrame::Type::RstStreamFrame: {
@@ -616,7 +613,7 @@ void QuicClientTransport::processPacketData(
         // Datagram isn't retransmittable. But we would like to ack them early.
         // So, make Datagram frames count towards ack policy
         pktHasRetransmittableData = true;
-        handleDatagram(*conn_, frame, receiveTimePoint);
+        handleDatagram(*conn_, frame, udpPacketTimings.receiveTimePoint);
         break;
       }
       case QuicFrame::Type::ImmediateAckFrame: {
@@ -805,7 +802,7 @@ void QuicClientTransport::processPacketData(
 
 void QuicClientTransport::onReadData(
     const folly::SocketAddress& peer,
-    NetworkDataSingle&& networkData) {
+    ReceivedPacket&& udpPacket) {
   if (closeState_ == CloseState::CLOSED) {
     // If we are closed, then we shouldn't process new network data.
     QUIC_STATS(
@@ -816,7 +813,7 @@ void QuicClientTransport::onReadData(
     return;
   }
   bool waitingForFirstPacket = !hasReceivedPackets(*conn_);
-  processUDPData(peer, std::move(networkData));
+  processUdpPacket(peer, std::move(udpPacket));
   if (connSetupCallback_ && waitingForFirstPacket &&
       hasReceivedPackets(*conn_)) {
     connSetupCallback_->onFirstPeerPacketProcessed();
@@ -1017,7 +1014,7 @@ void QuicClientTransport::startCryptoHandshake() {
       *clientConn_->initialDestinationConnectionId, version);
 
   setSupportedExtensionTransportParameters();
-  maybeEnableStreamGroups();
+
   auto paramsExtension = std::make_shared<ClientTransportParametersExtension>(
       conn_->originalVersion.value(),
       conn_->transportSettings.advertisedInitialConnectionFlowControlWindow,
@@ -1126,97 +1123,22 @@ void QuicClientTransport::onReadError(
   }
 }
 
-void QuicClientTransport::getReadBuffer(void** buf, size_t* len) noexcept {
-  DCHECK(conn_) << "trying to receive packets without a connection";
-  auto readBufferSize =
-      conn_->transportSettings.maxRecvPacketSize * numGROBuffers_;
-  readBuffer_ = folly::IOBuf::createCombined(readBufferSize);
-  *buf = readBuffer_->writableData();
-  *len = readBufferSize;
+void QuicClientTransport::getReadBuffer(
+    void** /* buf */,
+    size_t* /* len */) noexcept {
+  folly::terminate_with<std::runtime_error>("getReadBuffer unsupported");
 }
 
 void QuicClientTransport::onDataAvailable(
-    const folly::SocketAddress& server,
-    size_t len,
-    bool truncated,
-    OnDataAvailableParams params) noexcept {
-  VLOG(10) << "Got data from socket peer=" << server << " len=" << len;
-  auto packetReceiveTime = Clock::now();
-  Buf data = std::move(readBuffer_);
-
-  if (params.gro <= 0) {
-    if (truncated) {
-      // This is an error, drop the packet.
-      QUIC_STATS(
-          statsCallback_, onPacketDropped, PacketDropReason::UDP_TRUNCATED);
-      if (conn_->qLogger) {
-        conn_->qLogger->addPacketDrop(len, kUdpTruncated);
-      }
-      if (conn_->loopDetectorCallback) {
-        conn_->readDebugState.noReadReason = NoReadReason::TRUNCATED;
-        conn_->loopDetectorCallback->onSuspiciousReadLoops(
-            ++conn_->readDebugState.loopCount,
-            conn_->readDebugState.noReadReason);
-      }
-      return;
-    }
-    data->append(len);
-    trackDatagramReceived(len);
-    NetworkData networkData(std::move(data), packetReceiveTime);
-    onNetworkData(server, std::move(networkData));
-  } else {
-    // if we receive a truncated packet
-    // we still need to consider the prev valid ones
-    // AsyncUDPSocket::handleRead() sets the len to be the
-    // buffer size in case the data is truncated
-    if (truncated) {
-      auto delta = len % params.gro;
-      len -= delta;
-
-      QUIC_STATS(
-          statsCallback_, onPacketDropped, PacketDropReason::UDP_TRUNCATED);
-      if (conn_->qLogger) {
-        conn_->qLogger->addPacketDrop(delta, kUdpTruncated);
-      }
-    }
-
-    data->append(len);
-    trackDatagramReceived(len);
-
-    NetworkData networkData;
-    networkData.receiveTimePoint = packetReceiveTime;
-    networkData.packets.reserve((len + params.gro - 1) / params.gro);
-    size_t remaining = len;
-    size_t offset = 0;
-    while (remaining) {
-      if (static_cast<int>(remaining) > params.gro) {
-        auto tmp = data->cloneOne();
-        // start at offset
-        tmp->trimStart(offset);
-        // the actual len is len - offset now
-        // leave params.gro bytes
-        tmp->trimEnd(len - offset - params.gro);
-        DCHECK_EQ(tmp->length(), params.gro);
-
-        offset += params.gro;
-        remaining -= params.gro;
-        networkData.packets.emplace_back(std::move(tmp));
-      } else {
-        // do not clone the last packet
-        // start at offset, use all the remaining data
-        data->trimStart(offset);
-        DCHECK_EQ(data->length(), remaining);
-        remaining = 0;
-        networkData.packets.emplace_back(std::move(data));
-      }
-    }
-
-    onNetworkData(server, std::move(networkData));
-  }
+    const folly::SocketAddress& /* server */,
+    size_t /* len */,
+    bool /* truncated */,
+    OnDataAvailableParams /* params */) noexcept {
+  folly::terminate_with<std::runtime_error>("onDataAvailable unsupported");
 }
 
 bool QuicClientTransport::shouldOnlyNotify() {
-  return conn_->transportSettings.shouldRecvBatch;
+  return true;
 }
 
 void QuicClientTransport::recvMsg(
@@ -1311,9 +1233,9 @@ void QuicClientTransport::recvMsg(
       size_t len = bytesRead;
       size_t remaining = len;
       size_t offset = 0;
-      size_t totalNumPackets =
-          networkData.packets.size() + ((len + params.gro - 1) / params.gro);
-      networkData.packets.reserve(totalNumPackets);
+      size_t totalNumPackets = networkData.getPackets().size() +
+          ((len + params.gro - 1) / params.gro);
+      networkData.reserve(totalNumPackets);
       while (remaining) {
         if (static_cast<int>(remaining) > params.gro) {
           auto tmp = readBuffer->cloneOne();
@@ -1326,18 +1248,18 @@ void QuicClientTransport::recvMsg(
 
           offset += params.gro;
           remaining -= params.gro;
-          networkData.packets.emplace_back(std::move(tmp));
+          networkData.addPacket(ReceivedPacket(std::move(tmp)));
         } else {
           // do not clone the last packet
           // start at offset, use all the remaining data
           readBuffer->trimStart(offset);
           DCHECK_EQ(readBuffer->length(), remaining);
           remaining = 0;
-          networkData.packets.emplace_back(std::move(readBuffer));
+          networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
         }
       }
     } else {
-      networkData.packets.emplace_back(std::move(readBuffer));
+      networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
     }
     trackDatagramReceived(bytesRead);
   }
@@ -1416,9 +1338,7 @@ void QuicClientTransport::recvMmsg(
   }
 
   CHECK_LE(numMsgsRecvd, numPackets);
-  // Need to save our position so we can recycle the unused buffers.
-  uint16_t i;
-  for (i = 0; i < static_cast<uint16_t>(numMsgsRecvd); ++i) {
+  for (uint16_t i = 0; i < static_cast<uint16_t>(numMsgsRecvd); ++i) {
     auto& addr = recvmmsgStorage_.impl_[i].addr;
     auto& readBuffer = recvmmsgStorage_.impl_[i].readBuffer;
     auto& msg = msgs[i];
@@ -1457,9 +1377,9 @@ void QuicClientTransport::recvMmsg(
       size_t len = bytesRead;
       size_t remaining = len;
       size_t offset = 0;
-      size_t totalNumPackets =
-          networkData.packets.size() + ((len + params.gro - 1) / params.gro);
-      networkData.packets.reserve(totalNumPackets);
+      size_t totalNumPackets = networkData.getPackets().size() +
+          ((len + params.gro - 1) / params.gro);
+      networkData.reserve(totalNumPackets);
       while (remaining) {
         if (static_cast<int>(remaining) > params.gro) {
           auto tmp = readBuffer->cloneOne();
@@ -1472,18 +1392,18 @@ void QuicClientTransport::recvMmsg(
 
           offset += params.gro;
           remaining -= params.gro;
-          networkData.packets.emplace_back(std::move(tmp));
+          networkData.addPacket(ReceivedPacket(std::move(tmp)));
         } else {
           // do not clone the last packet
           // start at offset, use all the remaining data
           readBuffer->trimStart(offset);
           DCHECK_EQ(readBuffer->length(), remaining);
           remaining = 0;
-          networkData.packets.emplace_back(std::move(readBuffer));
+          networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
         }
       }
     } else {
-      networkData.packets.emplace_back(std::move(readBuffer));
+      networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
     }
 
     trackDatagramReceived(bytesRead);
@@ -1498,7 +1418,7 @@ void QuicClientTransport::onNotifyDataAvailable(
   const uint16_t numPackets = conn_->transportSettings.maxRecvBatchSize;
 
   NetworkData networkData;
-  networkData.packets.reserve(numPackets);
+  networkData.reserve(numPackets);
   size_t totalData = 0;
   folly::Optional<folly::SocketAddress> server;
 
@@ -1507,7 +1427,7 @@ void QuicClientTransport::onNotifyDataAvailable(
         readBufferSize, numPackets, networkData, server, totalData);
 
     // track the received packets
-    for (const auto& packet : networkData.packets) {
+    for (const auto& packet : networkData.getPackets()) {
       if (!packet.buf) {
         continue;
       }
@@ -1554,7 +1474,7 @@ void QuicClientTransport::onNotifyDataAvailable(
     recvMsg(sock, readBufferSize, numPackets, networkData, server, totalData);
   }
 
-  if (networkData.packets.empty()) {
+  if (networkData.getPackets().empty()) {
     // recvMmsg and recvMsg might have already set the reason and counter
     if (conn_->loopDetectorCallback) {
       if (conn_->readDebugState.noReadReason == NoReadReason::READ_OK) {
@@ -1572,8 +1492,7 @@ void QuicClientTransport::onNotifyDataAvailable(
   // TODO: we can get better receive time accuracy than this, with
   // SO_TIMESTAMP or SIOCGSTAMP.
   auto packetReceiveTime = Clock::now();
-  networkData.receiveTimePoint = packetReceiveTime;
-  networkData.totalData = totalData;
+  networkData.setReceiveTimePoint(packetReceiveTime);
   onNetworkData(*server, std::move(networkData));
 }
 
@@ -1699,47 +1618,43 @@ void QuicClientTransport::setSelfOwning() {
 
 void QuicClientTransport::setSupportedExtensionTransportParameters() {
   const auto& ts = conn_->transportSettings;
+  using TpId = TransportParameterId;
   customTransportParameters_.clear();
+
   if (ts.minAckDelay.hasValue()) {
-    CustomIntegralTransportParameter minAckDelayParam(
-        static_cast<uint64_t>(TransportParameterId::min_ack_delay),
-        ts.minAckDelay.value().count());
-    customTransportParameters_.push_back(minAckDelayParam.encode());
+    customTransportParameters_.push_back(encodeIntegerParameter(
+        TpId::min_ack_delay, ts.minAckDelay.value().count()));
   }
 
   if (ts.datagramConfig.enabled) {
-    CustomIntegralTransportParameter maxDatagramFrameSize(
-        static_cast<uint64_t>(TransportParameterId::max_datagram_frame_size),
-        conn_->datagramState.maxReadFrameSize);
-    customTransportParameters_.push_back(maxDatagramFrameSize.encode());
+    customTransportParameters_.push_back(encodeIntegerParameter(
+        TpId::max_datagram_frame_size, conn_->datagramState.maxReadFrameSize));
   }
 
-  CustomIntegralTransportParameter ackReceiveTimestampsEnabled(
-      static_cast<uint64_t>(
-          TransportParameterId::ack_receive_timestamps_enabled),
-      ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value() ? 1 : 0);
-  customTransportParameters_.push_back(ackReceiveTimestampsEnabled.encode());
+  customTransportParameters_.push_back(encodeIntegerParameter(
+      TpId::ack_receive_timestamps_enabled,
+      ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value() ? 1 : 0));
 
   if (ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value()) {
-    CustomIntegralTransportParameter maxReceiveTimestampsPerAck(
-        static_cast<uint64_t>(
-            TransportParameterId::max_receive_timestamps_per_ack),
+    customTransportParameters_.push_back(encodeIntegerParameter(
+        TpId::max_receive_timestamps_per_ack,
         ts.maybeAckReceiveTimestampsConfigSentToPeer.value()
-            .maxReceiveTimestampsPerAck);
-    customTransportParameters_.push_back(maxReceiveTimestampsPerAck.encode());
+            .maxReceiveTimestampsPerAck));
 
-    CustomIntegralTransportParameter receiveTimestampsExponent(
-        static_cast<uint64_t>(
-            TransportParameterId::receive_timestamps_exponent),
+    customTransportParameters_.push_back(encodeIntegerParameter(
+        TpId::receive_timestamps_exponent,
         ts.maybeAckReceiveTimestampsConfigSentToPeer.value()
-            .receiveTimestampsExponent);
-    customTransportParameters_.push_back(receiveTimestampsExponent.encode());
+            .receiveTimestampsExponent));
   }
 
   if (ts.advertisedKnobFrameSupport) {
-    CustomIntegralTransportParameter knobFrameSupport(
-        static_cast<uint64_t>(TransportParameterId::knob_frames_supported), 1);
-    customTransportParameters_.push_back(knobFrameSupport.encode());
+    customTransportParameters_.push_back(
+        encodeIntegerParameter(TpId::knob_frames_supported, 1));
+  }
+
+  if (ts.advertisedMaxStreamGroups > 0) {
+    customTransportParameters_.push_back(encodeIntegerParameter(
+        TpId::stream_groups_enabled, ts.advertisedMaxStreamGroups));
   }
 }
 
@@ -1841,21 +1756,6 @@ void QuicClientTransport::maybeSendTransportKnobs() {
       }
     }
     transportKnobsSent_ = true;
-  }
-}
-
-void QuicClientTransport::maybeEnableStreamGroups() {
-  if (conn_->transportSettings.advertisedMaxStreamGroups == 0) {
-    return;
-  }
-
-  CustomIntegralTransportParameter streamGroupsEnabledParam(
-      static_cast<uint64_t>(TransportParameterId::stream_groups_enabled),
-      conn_->transportSettings.advertisedMaxStreamGroups);
-
-  if (!setCustomTransportParameter(
-          streamGroupsEnabledParam, customTransportParameters_)) {
-    LOG(ERROR) << "failed to set stream groups enabled transport parameter";
   }
 }
 

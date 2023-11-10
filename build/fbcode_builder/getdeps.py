@@ -467,6 +467,13 @@ class CleanCmd(SubCmd):
         clean_dirs(opts)
 
 
+@cmd("show-scratch-dir", "show the scratch dir")
+class ShowScratchDirCmd(SubCmd):
+    def run(self, args):
+        opts = setup_build_options(args)
+        print(opts.scratch_dir)
+
+
 @cmd("show-build-dir", "print the build dir for a given project")
 class ShowBuildDirCmd(ProjectCmdBase):
     def run_project_cmd(self, args, loader, manifest):
@@ -497,6 +504,12 @@ class ShowInstDirCmd(ProjectCmdBase):
             manifests = [manifest]
 
         for m in manifests:
+            fetcher = loader.create_fetcher(m)
+            if isinstance(fetcher, SystemPackageFetcher):
+                # We are guaranteed that if the fetcher is set to
+                # SystemPackageFetcher then this item is completely
+                # satisfied by the appropriate system packages
+                continue
             inst_dir = loader.get_project_install_dir_respecting_install_prefix(m)
             print(inst_dir)
 
@@ -988,6 +1001,9 @@ name: {job_name}
 
 on:{run_on}
 
+permissions:
+  contents: read  #  to fetch code (actions/checkout)
+
 jobs:
 """
             )
@@ -1009,7 +1025,7 @@ jobs:
                 # https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/
                 out.write("    - name: Export boost environment\n")
                 out.write(
-                    '      run: "echo BOOST_ROOT=%BOOST_ROOT_1_78_0% >> %GITHUB_ENV%"\n'
+                    '      run: "echo BOOST_ROOT=%BOOST_ROOT_1_83_0% >> %GITHUB_ENV%"\n'
                 )
                 out.write("      shell: cmd\n")
 
@@ -1020,7 +1036,7 @@ jobs:
                 out.write("    - name: Disable autocrlf\n")
                 out.write("      run: git config --system core.autocrlf false\n")
 
-            out.write("    - uses: actions/checkout@v2\n")
+            out.write("    - uses: actions/checkout@v4\n")
 
             if build_opts.free_up_disk:
                 free_up_disk = "--free-up-disk "
@@ -1053,6 +1069,11 @@ jobs:
                 out.write(
                     f"      run: {sudo_arg}python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive {manifest.name}\n"
                 )
+                if build_opts.is_linux() or build_opts.is_freebsd():
+                    out.write("    - name: Install packaging system deps\n")
+                    out.write(
+                        f"      run: {sudo_arg}python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive patchelf\n"
+                    )
 
             projects = loader.manifests_in_dependency_order()
 

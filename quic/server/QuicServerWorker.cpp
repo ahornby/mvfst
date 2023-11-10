@@ -590,9 +590,8 @@ void QuicServerWorker::forwardNetworkData(
           "Forwarding packet with unknown connId version from client={} to another process, routingInfo={}",
           client.describe(),
           logRoutingInfo(routingData.destinationConnId));
-      auto recvTime = networkData.receiveTimePoint;
       takeoverPktHandler_.forwardPacketToAnotherServer(
-          client, std::move(networkData).moveAllData(), recvTime);
+          client, std::move(networkData));
       QUIC_STATS(statsCallback_, onPacketForwarded);
       return;
     } else {
@@ -662,6 +661,10 @@ QuicServerTransport::Ptr QuicServerWorker::makeTransport(
         << (transportSettings.dataPathType == DataPathType::ContinuousMemory
                 ? "ContinuousMemory"
                 : "ChainedMemory");
+    if (quicVersion == QuicVersion::MVFST_EXPERIMENTAL2) {
+      transportSettings.includeCwndHintsInSessionTicket = true;
+      transportSettings.useCwndHintsInSessionTicket = true;
+    }
     trans->setTransportSettings(transportSettings);
     trans->setConnectionIdAlgo(connIdAlgo_.get());
     trans->setServerConnectionIdRejector(this);
@@ -791,9 +794,8 @@ void QuicServerWorker::dispatchPacketData(
         "Forwarding packet from client={} to another process, routingInfo={}",
         client.describe(),
         logRoutingInfo(dstConnId));
-    auto recvTime = networkData.receiveTimePoint;
     takeoverPktHandler_.forwardPacketToAnotherServer(
-        client, std::move(networkData).moveAllData(), recvTime);
+        client, std::move(networkData));
     QUIC_STATS(statsCallback_, onPacketForwarded);
   });
 
@@ -875,7 +877,7 @@ void QuicServerWorker::dispatchPacketData(
   // This could be a new connection, add it in the map
   // verify that the initial packet is at least min initial bytes
   // to avoid amplification attacks. Also check CID sizes.
-  if (networkData.totalData < kMinInitialPacketSize ||
+  if (networkData.getTotalData() < kMinInitialPacketSize ||
       !isValidConnIdLength(dstConnId)) {
     // Don't even attempt to forward the packet, just drop it.
     VLOG(3) << "Dropping small initial packet from client=" << client;
@@ -885,7 +887,7 @@ void QuicServerWorker::dispatchPacketData(
 
   // If there is a token present, decrypt it (could be either a retry
   // token or a new token)
-  folly::io::Cursor cursor(networkData.packets.front().buf.get());
+  folly::io::Cursor cursor(networkData.getPackets().front().buf.get());
   auto maybeEncryptedToken = maybeGetEncryptedToken(cursor);
   bool hasTokenSecret = transportSettings_.retryTokenSecret.hasValue();
 
@@ -910,7 +912,7 @@ void QuicServerWorker::dispatchPacketData(
   // send a retry packet back to the client
   if (!isValidRetryToken &&
       ((newConnRateLimiter_ &&
-        newConnRateLimiter_->check(networkData.receiveTimePoint)) ||
+        newConnRateLimiter_->check(networkData.getReceiveTimePoint())) ||
        (unfinishedHandshakeLimitFn_.has_value() &&
         globalUnfinishedHandshakes >= (*unfinishedHandshakeLimitFn_)()))) {
     QUIC_STATS(statsCallback_, onConnectionRateLimited);
@@ -944,7 +946,7 @@ void QuicServerWorker::sendResetPacket(
     // Only send resets in response to short header packets.
     return;
   }
-  auto packetSize = networkData.totalData;
+  auto packetSize = networkData.getTotalData();
   auto resetSize = std::min<uint16_t>(packetSize, kDefaultMaxUDPPayload);
   // Per the spec, less than 43 we should respond with packet size - 1.
   if (packetSize < 43) {

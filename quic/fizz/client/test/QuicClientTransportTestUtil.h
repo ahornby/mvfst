@@ -411,8 +411,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
         {QuicVersion::MVFST,
          MVFST1,
          QuicVersion::QUIC_V1,
-         QuicVersion::QUIC_V1_ALIAS,
-         QuicVersion::QUIC_DRAFT});
+         QuicVersion::QUIC_V1_ALIAS});
     connIdAlgo_ = std::make_unique<DefaultConnectionIdAlgo>();
     ON_CALL(*sock, resumeRead(testing::_))
         .WillByDefault(testing::SaveArg<0>(&networkReadCallback));
@@ -720,7 +719,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
       NetworkData&& data,
       bool writes = true,
       folly::SocketAddress* peer = nullptr) {
-    for (const auto& packet : data.packets) {
+    for (const auto& packet : data.getPackets()) {
       deliverDataWithoutErrorCheck(
           peer == nullptr ? serverAddr : *peer, packet.buf->coalesce(), writes);
     }
@@ -756,7 +755,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
       NetworkData&& data,
       bool writes = true,
       folly::SocketAddress* peer = nullptr) {
-    for (const auto& packet : data.packets) {
+    for (const auto& packet : data.getPackets()) {
       deliverData(
           peer == nullptr ? serverAddr : *peer, packet.buf->coalesce(), writes);
     }

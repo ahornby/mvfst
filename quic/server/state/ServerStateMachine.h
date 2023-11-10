@@ -44,7 +44,7 @@ enum ServerState {
 struct ServerEvents {
   struct ReadData {
     folly::SocketAddress peer;
-    NetworkDataSingle networkData;
+    ReceivedPacket udpPacket;
   };
 
   struct Close {};
@@ -122,6 +122,8 @@ struct QuicServerConnectionState : public QuicConnectionStateBase {
   // A false value indicates 0-rtt is rejected.
   folly::Optional<bool> transportParamsMatching;
 
+  folly::Optional<uint64_t> maybeCwndHintBytes;
+
   // Whether source address token matches client ip.
   // A false value indicates either 0-rtt is rejected or inflight bytes are
   // limited until CFIN depending on matching policy.
@@ -167,8 +169,7 @@ struct QuicServerConnectionState : public QuicConnectionStateBase {
          QuicVersion::MVFST_EXPERIMENTAL3,
          QuicVersion::MVFST_ALIAS,
          QuicVersion::QUIC_V1,
-         QuicVersion::QUIC_V1_ALIAS,
-         QuicVersion::QUIC_DRAFT}};
+         QuicVersion::QUIC_V1_ALIAS}};
     originalVersion = QuicVersion::MVFST;
     DCHECK(handshakeFactory);
     auto tmpServerHandshake =
@@ -227,7 +228,8 @@ void updateTransportParamsFromTicket(
     uint64_t initialMaxStreamDataBidiRemote,
     uint64_t initialMaxStreamDataUni,
     uint64_t initialMaxStreamsBidi,
-    uint64_t initialMaxStreamsUni);
+    uint64_t initialMaxStreamsUni,
+    folly::Optional<uint64_t> maybeCwndHintBytes);
 
 void onConnectionMigration(
     QuicServerConnectionState& conn,

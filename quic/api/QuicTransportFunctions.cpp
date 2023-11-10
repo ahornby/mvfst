@@ -1487,8 +1487,6 @@ WriteQuicDataResult writeConnectionDataToSocket(
   auto batchWriter = BatchWriterFactory::makeBatchWriter(
       connection.transportSettings.batchingMode,
       connection.transportSettings.maxBatchSize,
-      connection.transportSettings.useThreadLocalBatching,
-      connection.transportSettings.threadLocalDelay,
       connection.transportSettings.dataPathType,
       connection,
       *connection.gsoSupported);
@@ -1498,7 +1496,6 @@ WriteQuicDataResult writeConnectionDataToSocket(
       : &static_cast<QuicClientConnectionState&>(connection).happyEyeballsState;
   IOBufQuicBatch ioBufBatch(
       std::move(batchWriter),
-      connection.transportSettings.useThreadLocalBatching,
       sock,
       connection.peerAddress,
       connection.statsCallback,
@@ -1882,36 +1879,6 @@ bool hasInitialOrHandshakeCiphers(QuicConnectionStateBase& conn) {
   return conn.initialWriteCipher || conn.handshakeWriteCipher ||
       conn.readCodec->getInitialCipher() ||
       conn.readCodec->getHandshakeReadCipher();
-}
-
-bool setCustomTransportParameter(
-    const CustomTransportParameter& customParam,
-    std::vector<TransportParameter>& customTransportParameters) {
-  // Check that the parameter id is in the "private parameter" range, as
-  // described by the spec.
-  if (static_cast<uint16_t>(customParam.getParameterId()) <
-      kCustomTransportParameterThreshold) {
-    LOG(ERROR) << "invalid parameter id";
-    return false;
-  }
-
-  // check to see that we haven't already added in a parameter with the
-  // specified parameter id
-  auto it = std::find_if(
-      customTransportParameters.begin(),
-      customTransportParameters.end(),
-      [&customParam](const TransportParameter& param) {
-        return param.parameter == customParam.getParameterId();
-      });
-
-  // if a match has been found, we return failure
-  if (it != customTransportParameters.end()) {
-    LOG(ERROR) << "transport parameter already present";
-    return false;
-  }
-
-  customTransportParameters.push_back(customParam.encode());
-  return true;
 }
 
 bool toWriteInitialAcks(const quic::QuicConnectionStateBase& conn) {

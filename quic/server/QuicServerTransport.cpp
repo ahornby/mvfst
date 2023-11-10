@@ -25,8 +25,8 @@ namespace quic {
 QuicServerTransport::QuicServerTransport(
     folly::EventBase* evb,
     std::unique_ptr<QuicAsyncUDPSocketWrapper> sock,
-    ConnectionSetupCallback* connSetupCb,
-    ConnectionCallback* connStreamsCb,
+    folly::MaybeManagedPtr<ConnectionSetupCallback> connSetupCb,
+    folly::MaybeManagedPtr<ConnectionCallback> connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     std::unique_ptr<CryptoFactory> cryptoFactory,
     PacketNum startingPacketNum)
@@ -43,8 +43,8 @@ QuicServerTransport::QuicServerTransport(
 QuicServerTransport::QuicServerTransport(
     folly::EventBase* evb,
     std::unique_ptr<QuicAsyncUDPSocketWrapper> sock,
-    ConnectionSetupCallback* connSetupCb,
-    ConnectionCallback* connStreamsCb,
+    folly::MaybeManagedPtr<ConnectionSetupCallback> connSetupCb,
+    folly::MaybeManagedPtr<ConnectionCallback> connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     std::unique_ptr<CryptoFactory> cryptoFactory,
     bool useConnectionEndWithErrorCallback)
@@ -85,8 +85,8 @@ QuicServerTransport::~QuicServerTransport() {
 QuicServerTransport::Ptr QuicServerTransport::make(
     folly::EventBase* evb,
     std::unique_ptr<QuicAsyncUDPSocketWrapper> sock,
-    ConnectionSetupCallback* connSetupCb,
-    ConnectionCallback* connStreamsCb,
+    const folly::MaybeManagedPtr<ConnectionSetupCallback>& connSetupCb,
+    const folly::MaybeManagedPtr<ConnectionCallback>& connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     bool useConnectionEndWithErrorCallback) {
   return std::make_shared<QuicServerTransport>(
@@ -144,10 +144,10 @@ void QuicServerTransport::setServerConnectionIdRejector(
 
 void QuicServerTransport::onReadData(
     const folly::SocketAddress& peer,
-    NetworkDataSingle&& networkData) {
+    ReceivedPacket&& udpPacket) {
   ServerEvents::ReadData readData;
   readData.peer = peer;
-  readData.networkData = std::move(networkData);
+  readData.udpPacket = std::move(udpPacket);
   bool waitingForFirstPacket = !hasReceivedPackets(*conn_);
   uint64_t prevWritableBytes = serverConn_->writableBytesLimit
       ? *serverConn_->writableBytesLimit
@@ -512,8 +512,8 @@ void QuicServerTransport::processPendingData(bool async) {
         serverPtr->onNetworkData(
             pendingPacket.peer,
             NetworkData(
-                std::move(pendingPacket.networkData.packet.buf),
-                pendingPacket.networkData.receiveTimePoint));
+                std::move(pendingPacket.udpPacket.buf),
+                pendingPacket.udpPacket.timings.receiveTimePoint));
         if (serverPtr->closeState_ == CloseState::CLOSED) {
           // The pending data could potentially contain a connection close, or
           // the app could have triggered a connection close with an error. It
@@ -534,13 +534,50 @@ void QuicServerTransport::processPendingData(bool async) {
   }
 }
 
+bool QuicServerTransport::shouldWriteNewSessionTicket() {
+  if (!newSessionTicketWrittenTimestamp_) {
+    // No session ticket has been written yet, we should write one.
+    return true;
+  }
+  // Conditions for writing more session tickets after the first one:
+  // 1. includeCwndHintsInSessionTicket transport setting is set
+  // 2. The current congestion window is either smaller than or more than twice
+  // the last one we sent in a session ticket
+  // 3. We haven't sent any session ticket in the last
+  // kMinIntervalBetweenSessionTickets
+
+  if (serverConn_->congestionController &&
+      conn_->transportSettings.includeCwndHintsInSessionTicket &&
+      Clock::now() - newSessionTicketWrittenTimestamp_.value() >
+          kMinIntervalBetweenSessionTickets) {
+    bool cwndChangedSinceLastHint =
+        !newSessionTicketWrittenCwndHint_.has_value() ||
+        conn_->congestionController->getCongestionWindow() / 2 >
+            *newSessionTicketWrittenCwndHint_ ||
+        conn_->congestionController->getCongestionWindow() <
+            *newSessionTicketWrittenCwndHint_;
+    if (cwndChangedSinceLastHint) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void QuicServerTransport::maybeWriteNewSessionTicket() {
-  if (!newSessionTicketWritten_ && !ctx_->getSendNewSessionTicket() &&
+  if (shouldWriteNewSessionTicket() && !ctx_->getSendNewSessionTicket() &&
       serverConn_->serverHandshakeLayer->isHandshakeDone()) {
+    VLOG(7) << "Writing a new session ticket with cwnd="
+            << conn_->congestionController->getCongestionWindow();
     if (conn_->qLogger) {
       conn_->qLogger->addTransportStateUpdate(kWriteNst);
     }
-    newSessionTicketWritten_ = true;
+    newSessionTicketWrittenTimestamp_ = Clock::now();
+    folly::Optional<uint64_t> cwndHint = folly::none;
+    if (conn_->transportSettings.includeCwndHintsInSessionTicket &&
+        conn_->congestionController) {
+      cwndHint = conn_->congestionController->getCongestionWindow();
+      newSessionTicketWrittenCwndHint_ = cwndHint;
+    }
     AppToken appToken;
     appToken.transportParams = createTicketTransportParameters(
         conn_->transportSettings.idleTimeout.count(),
@@ -552,7 +589,8 @@ void QuicServerTransport::maybeWriteNewSessionTicket() {
             .advertisedInitialBidiRemoteStreamFlowControlWindow,
         conn_->transportSettings.advertisedInitialUniStreamFlowControlWindow,
         conn_->transportSettings.advertisedInitialMaxStreamsBidi,
-        conn_->transportSettings.advertisedInitialMaxStreamsUni);
+        conn_->transportSettings.advertisedInitialMaxStreamsUni,
+        cwndHint);
     appToken.sourceAddresses = serverConn_->tokenSourceAddresses;
     appToken.version = conn_->version.value();
     // If a client connects to server for the first time and doesn't attempt

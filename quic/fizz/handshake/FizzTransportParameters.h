@@ -12,29 +12,39 @@
 #include <quic/common/BufUtil.h>
 #include <quic/handshake/TransportParameters.h>
 
-namespace quic {
+namespace {
+
+inline quic::Buf encodeVarintParams(
+    const std::vector<quic::TransportParameter>& parameters) {
+  // chain all encodings
+  quic::BufQueue queue;
+  for (const auto& param : parameters) {
+    queue.append(param.encode());
+  }
+
+  if (auto encodedParams = queue.move()) {
+    // coalesce and return
+    encodedParams->coalesce();
+    return encodedParams;
+  }
+
+  // callers expect empty buf if no parameters supplied
+  return folly::IOBuf::create(0);
+}
 
 inline fizz::ExtensionType getQuicTransportParametersExtention(
-    QuicVersion version) {
-  if (version == QuicVersion::QUIC_V1 ||
-      version == QuicVersion::QUIC_V1_ALIAS) {
+    quic::QuicVersion version) {
+  if (version == quic::QuicVersion::QUIC_V1 ||
+      version == quic::QuicVersion::QUIC_V1_ALIAS) {
     return fizz::ExtensionType::quic_transport_parameters;
   } else {
     return fizz::ExtensionType::quic_transport_parameters_draft;
   }
 }
 
-inline void encodeVarintParams(
-    const std::vector<TransportParameter>& parameters,
-    BufAppender& appender) {
-  auto appenderOp = [&](auto val) { appender.writeBE(val); };
-  for (auto& param : parameters) {
-    encodeQuicInteger(static_cast<uint64_t>(param.parameter), appenderOp);
-    size_t len = param.value->computeChainDataLength();
-    encodeQuicInteger(len, appenderOp);
-    appender.insert(param.value->clone());
-  }
-}
+} // namespace
+
+namespace quic {
 
 inline void removeDuplicateParams(std::vector<TransportParameter>& params) {
   std::sort(
@@ -80,9 +90,7 @@ inline fizz::Extension encodeExtension(
     QuicVersion encodingVersion) {
   fizz::Extension ext;
   ext.extension_type = getQuicTransportParametersExtention(encodingVersion);
-  ext.extension_data = folly::IOBuf::create(0);
-  BufAppender appender(ext.extension_data.get(), 40);
-  encodeVarintParams(params.parameters, appender);
+  ext.extension_data = encodeVarintParams(params.parameters);
   return ext;
 }
 
@@ -91,9 +99,7 @@ inline fizz::Extension encodeExtension(
     QuicVersion encodingVersion) {
   fizz::Extension ext;
   ext.extension_type = getQuicTransportParametersExtention(encodingVersion);
-  ext.extension_data = folly::IOBuf::create(0);
-  BufAppender appender(ext.extension_data.get(), 40);
-  encodeVarintParams(params.parameters, appender);
+  ext.extension_data = encodeVarintParams(params.parameters);
   return ext;
 }
 
@@ -102,9 +108,7 @@ inline fizz::Extension encodeExtension(
     QuicVersion encodingVersion) {
   fizz::Extension ext;
   ext.extension_type = getQuicTransportParametersExtention(encodingVersion);
-  ext.extension_data = folly::IOBuf::create(0);
-  BufAppender appender(ext.extension_data.get(), 40);
-  encodeVarintParams(params.parameters, appender);
+  ext.extension_data = encodeVarintParams(params.parameters);
   return ext;
 }
 
@@ -188,54 +192,9 @@ inline void validateTransportExtensions(
                 "unexpected extension type ({:#x}) for quic v1",
                 extension.extension_type),
             fizz::AlertDescription::illegal_parameter);
-      } else if (
-          encodingVersion == quic::QuicVersion::QUIC_DRAFT &&
-          extension.extension_type !=
-              fizz::ExtensionType::quic_transport_parameters_draft) {
-        // This is a QUIC draft version using an incorrect transport parameters
-        // extension type
-        throw fizz::FizzException(
-            fmt::format(
-                "unexpected extension type ({:#x}) for quic draft version",
-                extension.extension_type),
-            fizz::AlertDescription::illegal_parameter);
       }
       found = true;
     }
   }
 }
-
-namespace detail {
-
-template <>
-struct Reader<quic::TransportParameter> {
-  template <class T>
-  size_t read(quic::TransportParameter& param, folly::io::Cursor& cursor) {
-    size_t len = 0;
-    uint16_t tmpId;
-    len += detail::read(tmpId, cursor);
-    param.parameter = static_cast<quic::TransportParameterId>(tmpId);
-    len += readBuf<uint16_t>(param.value, cursor);
-    return len;
-  }
-};
-
-template <>
-struct Writer<quic::TransportParameter> {
-  template <class T>
-  void write(const quic::TransportParameter& param, folly::io::Appender& out) {
-    uint16_t tmpId = static_cast<uint16_t>(param.parameter);
-    detail::write(tmpId, out);
-    detail::writeBuf<uint16_t>(param.value, out);
-  }
-};
-
-template <>
-struct Sizer<quic::TransportParameter> {
-  template <class T>
-  size_t getSize(const quic::TransportParameter& param) {
-    return sizeof(uint16_t) + getBufSize<uint16_t>(param.value);
-  }
-};
-} // namespace detail
 } // namespace fizz

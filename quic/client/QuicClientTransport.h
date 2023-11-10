@@ -122,9 +122,8 @@ class QuicClientTransport
   }
 
   // From QuicTransportBase
-  void onReadData(
-      const folly::SocketAddress& peer,
-      NetworkDataSingle&& networkData) override;
+  void onReadData(const folly::SocketAddress& peer, ReceivedPacket&& udpPacket)
+      override;
   void writeData() override;
   void closeTransport() override;
   void unbindConnection() override;
@@ -235,14 +234,42 @@ class QuicClientTransport
       folly::Optional<folly::SocketAddress>& server,
       size_t& totalData);
 
-  void processUDPData(
+  /**
+   * Process a single UDP packet.
+   *
+   * A single UDP packet can contain multiple QUIC packets due to UDP packet
+   * coalescing (see RFC 9000, section 12.2). When invoked, this function
+   * attempts to transform the UDP packet data into one or more QUIC packets
+   *
+   * @param peer              The address of the remote peer.
+   * @param networkData       UDP packet.
+   */
+  void processUdpPacket(
       const folly::SocketAddress& peer,
-      NetworkDataSingle&& networkData);
+      ReceivedPacket&& udpPacket);
 
-  void processPacketData(
+  /**
+   * Process data within a single UDP packet.
+   *
+   * A single UDP packet can contain multiple QUIC packets due to UDP packet
+   * coalescing (see RFC 9000, section 12.2). When invoked, this function takes
+   * UDP packet data and extracts a single QUIC packet from it. If there is
+   * still data left over, it will remain in `udpPacketData` and can be
+   * extracted by invoking this function again.
+   *
+   * Since all QUIC packets are extracted from the same UDP packet, the packet
+   * timings associated with that UDP packet are used for all QUIC packets.
+   *
+   * @param peer              The address of the remote peer.
+   * @param udpPacketTimings  Timings associated with UDP packet.
+   * @param udpPacketData     Buffer containing remaining UDP packet data.
+   *                          Bytes transformed into a QUIC packet will be
+   *                          removed from this buffer.
+   */
+  void processUdpPacketData(
       const folly::SocketAddress& peer,
-      TimePoint receiveTimePoint,
-      BufQueue& packetQueue);
+      const ReceivedPacket::Timings& udpPacketTimings,
+      BufQueue& udpPacketData);
 
   void startCryptoHandshake();
 
@@ -253,7 +280,6 @@ class QuicClientTransport
       const QuicWriteFrame& packetFrame,
       const ReadAckFrame&);
 
-  Buf readBuffer_;
   folly::Optional<std::string> hostname_;
   HappyEyeballsConnAttemptDelayTimeout happyEyeballsConnAttemptDelayTimeout_;
 
@@ -282,8 +308,6 @@ class QuicClientTransport
    * calls setKnobs() internally.
    */
   void maybeSendTransportKnobs();
-
-  void maybeEnableStreamGroups();
 
   bool replaySafeNotified_{false};
   // Set it QuicClientTransport is in a self owning mode. This will be cleaned

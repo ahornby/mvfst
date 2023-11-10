@@ -73,8 +73,12 @@ struct CongestionControlConfig {
   bool ignoreInflightHi{false};
 
   // Used by: BBR2
-  // Wether BBR2 should ignore packet loss (i.e. act more like BBR1)
+  // Whether BBR2 should ignore packet loss (i.e. act more like BBR1)
   bool ignoreLoss{false};
+
+  // Used by: BBR2
+  // Whether BBR2 should advance the cycle count on exiting startup
+  bool advanceCycleAfterStartup{true};
 };
 
 struct DatagramConfig {
@@ -178,11 +182,6 @@ struct TransportSettings {
   uint16_t flowControlWindowFrequency{2};
   // batching mode
   QuicBatchingMode batchingMode{QuicBatchingMode::BATCHING_MODE_NONE};
-  // use thread local batcher - currently it works only with
-  // BATCHING_MODE_SENDMMSG_GSO it will not be enabled if the mode is different
-  bool useThreadLocalBatching{false};
-  // thread local delay interval
-  std::chrono::microseconds threadLocalDelay{kDefaultThreadLocalDelay};
   // maximum number of packets we can batch. This does not apply to
   // BATCHING_MODE_NONE
   uint32_t maxBatchSize{kDefaultQuicMaxBatchSize};
@@ -292,6 +291,10 @@ struct TransportSettings {
   bool dropIngressOnStopSending{false};
   bool advertisedKnobFrameSupport{true};
   bool removeStreamAfterEomCallbackUnset{false};
+  // Whether to include cwnd hint in new session tickets for 0-rtt
+  bool includeCwndHintsInSessionTicket{false};
+  // Whether to use cwnd hints received in resumption tickets for 0-rtt
+  bool useCwndHintsInSessionTicket{false};
 
   // The default priority to instantiate streams with.
   Priority defaultPriority{kDefaultPriority};

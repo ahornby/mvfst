@@ -13,6 +13,7 @@
 #include <quic/api/QuicSocket.h>
 #include <quic/api/QuicTransportBase.h>
 #include <quic/codec/DefaultConnectionIdAlgo.h>
+#include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 #include <quic/server/state/ServerStateMachine.h>
@@ -24,6 +25,7 @@
 #include <quic/state/test/Mocks.h>
 
 #include <quic/common/testutil/MockAsyncUDPSocket.h>
+#include <memory>
 
 using namespace testing;
 using namespace folly;
@@ -226,11 +228,11 @@ class TestQuicTransport
       public std::enable_shared_from_this<TestQuicTransport> {
  public:
   TestQuicTransport(
-      folly::EventBase* evb,
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+      std::shared_ptr<QuicEventBase> evb,
+      std::unique_ptr<QuicAsyncUDPSocket> socket,
       ConnectionSetupCallback* connSetupCb,
       ConnectionCallback* connCb)
-      : QuicTransportBase(evb, std::move(socket)),
+      : QuicTransportBase(std::move(evb), std::move(socket)),
         observerContainer_(std::make_shared<SocketObserverContainer>(this)) {
     setConnectionSetupCallback(connSetupCb);
     setConnectionCallback(connCb);
@@ -259,11 +261,11 @@ class TestQuicTransport
     closeUdpSocket();
   }
 
-  std::chrono::milliseconds getLossTimeoutRemainingTime() const {
-    return lossTimeout_.getTimeRemaining();
+  std::chrono::milliseconds getLossTimeoutRemainingTime() {
+    return lossTimeout_.getTimerCallbackTimeRemaining();
   }
 
-  void onReadData(const folly::SocketAddress&, ReceivedPacket&& udpPacket)
+  void onReadData(const folly::SocketAddress&, ReceivedUdpPacket&& udpPacket)
       override {
     if (!udpPacket.buf) {
       return;
@@ -363,7 +365,7 @@ class TestQuicTransport
   }
 
   void invokeCancelPingTimeout() {
-    pingTimeout_.cancelTimeout();
+    pingTimeout_.cancelTimerCallback();
   }
 
   void invokeHandlePingCallbacks() {
@@ -375,10 +377,7 @@ class TestQuicTransport
   }
 
   bool isPingTimeoutScheduled() {
-    if (pingTimeout_.isScheduled()) {
-      return true;
-    }
-    return false;
+    return pingTimeout_.isTimerCallbackScheduled();
   }
 
   auto& writeLooper() {
@@ -568,16 +567,13 @@ class TestQuicTransport
 class QuicTransportImplTest : public Test {
  public:
   void SetUp() override {
-    backingEvb = std::make_unique<folly::EventBase>();
-    evb = std::make_unique<QuicEventBase>(backingEvb.get());
-    auto socket = std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(
-        backingEvb.get());
+    fEvb = std::make_unique<folly::EventBase>();
+    qEvb = std::make_shared<FollyQuicEventBase>(fEvb.get());
+    auto socket =
+        std::make_unique<NiceMock<quic::test::MockAsyncUDPSocket>>(qEvb);
     socketPtr = socket.get();
     transport = std::make_shared<TestQuicTransport>(
-        evb->getBackingEventBase(),
-        std::move(socket),
-        &connSetupCallback,
-        &connCallback);
+        qEvb, std::move(socket), &connSetupCallback, &connCallback);
     auto& conn = *transport->transportConn;
     conn.flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiLocal =
         kDefaultStreamFlowControlWindow;
@@ -605,8 +601,8 @@ class QuicTransportImplTest : public Test {
   }
 
  protected:
-  std::unique_ptr<folly::EventBase> backingEvb;
-  std::unique_ptr<QuicEventBase> evb;
+  std::unique_ptr<folly::EventBase> fEvb;
+  std::shared_ptr<FollyQuicEventBase> qEvb;
   NiceMock<MockConnectionSetupCallback> connSetupCallback;
   NiceMock<MockConnectionCallback> connCallback;
   TestByteEventCallback byteEventCallback;
@@ -1459,7 +1455,7 @@ TEST_P(QuicTransportImplTestBase, onNewBidirectionalStreamSetReadCallback) {
     }
   }
   transport->addDataToStream(stream3, StreamBuffer(readData->clone(), 0, true));
-  evb->loopOnce();
+  qEvb->loopOnce();
   transport.reset();
 }
 
@@ -1652,7 +1648,7 @@ TEST_P(QuicTransportImplTestBase, ReadDataAlsoChecksLossAlarm) {
       stream, StreamBuffer(folly::IOBuf::copyBuffer("Data"), 0));
   EXPECT_TRUE(transport->writeLooper()->isRunning());
   // Drive the event loop once to allow for the write looper to continue.
-  evb->loopOnce();
+  qEvb->loopOnce();
   EXPECT_TRUE(transport->isLossTimeoutScheduled());
   transport.reset();
 }
@@ -1665,7 +1661,7 @@ TEST_P(QuicTransportImplTestBase, ConnectionErrorOnWrite) {
   transport->writeChain(stream, folly::IOBuf::copyBuffer("Hey"), true, nullptr);
   transport->addDataToStream(
       stream, StreamBuffer(folly::IOBuf::copyBuffer("Data"), 0));
-  evb->loopOnce();
+  qEvb->loopOnce();
 
   EXPECT_TRUE(transport->isClosed());
   EXPECT_EQ(
@@ -1694,7 +1690,7 @@ TEST_P(QuicTransportImplTestBase, ReadErrorUnsanitizedErrorMsg) {
       folly::IOBuf::copyBuffer("You are being too loud."),
       true,
       nullptr);
-  evb->loopOnce();
+  qEvb->loopOnce();
 
   EXPECT_TRUE(transport->isClosed());
 }
@@ -1714,7 +1710,7 @@ TEST_P(QuicTransportImplTestBase, ConnectionErrorUnhandledException) {
   transport->writeChain(stream, folly::IOBuf::copyBuffer("Hey"), true, nullptr);
   transport->addDataToStream(
       stream, StreamBuffer(folly::IOBuf::copyBuffer("Data"), 0));
-  evb->loopOnce();
+  qEvb->loopOnce();
 
   EXPECT_TRUE(transport->isClosed());
   EXPECT_EQ(
@@ -1723,7 +1719,7 @@ TEST_P(QuicTransportImplTestBase, ConnectionErrorUnhandledException) {
 }
 
 TEST_P(QuicTransportImplTestBase, LossTimeoutNoLessThanTickInterval) {
-  auto tickInterval = evb->getTimerTickInterval();
+  auto tickInterval = qEvb->getTimerTickInterval();
   transport->scheduleLossTimeout(tickInterval - 1ms);
   EXPECT_NEAR(
       tickInterval.count(),
@@ -1743,6 +1739,7 @@ TEST_P(QuicTransportImplTestBase, CloseStreamAfterReadError) {
   transport->closeStream(stream1);
 
   EXPECT_CALL(readCb1, readError(stream1, IsError(LocalErrorCode::NO_ERROR)));
+  EXPECT_CALL(connCallback, onStreamPreReaped(stream1));
   transport->driveReadCallbacks();
 
   EXPECT_FALSE(transport->transportConn->streamManager->streamExists(stream1));
@@ -2006,7 +2003,7 @@ TEST_P(QuicTransportImplTestBase, RegisterTxDeliveryCallbackLowerThanExpected) {
   EXPECT_CALL(dcb3, onDeliveryAck(stream, 2, _));
   transport->registerTxCallback(stream, 2, &txcb3);
   transport->registerDeliveryCallback(stream, 2, &dcb3);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb3);
   Mock::VerifyAndClearExpectations(&dcb3);
 
@@ -2038,7 +2035,7 @@ TEST_F(
   transport->registerTxCallback(stream, 2, &txcb);
   transport->registerDeliveryCallback(stream, 2, &dcb);
   transport->close(folly::none);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb);
   Mock::VerifyAndClearExpectations(&dcb);
 }
@@ -2074,7 +2071,7 @@ TEST_P(
   // Deliver the first set of registrations.
   EXPECT_CALL(txcb1, onByteEvent(getTxMatcher(stream, 3))).Times(1);
   EXPECT_CALL(txcb2, onByteEvent(getTxMatcher(stream, 3))).Times(1);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb1);
   Mock::VerifyAndClearExpectations(&txcb2);
 }
@@ -2112,7 +2109,7 @@ TEST_F(
   // Deliver the first set of registrations.
   EXPECT_CALL(txcb1, onByteEvent(getAckMatcher(stream, 3))).Times(1);
   EXPECT_CALL(txcb2, onByteEvent(getAckMatcher(stream, 3))).Times(1);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb1);
   Mock::VerifyAndClearExpectations(&txcb2);
 }
@@ -2150,7 +2147,7 @@ TEST_P(
   // confirm.
   EXPECT_CALL(txcb1, onByteEvent(getTxMatcher(stream, 3))).Times(0);
   EXPECT_CALL(txcb2, onByteEvent(getTxMatcher(stream, 3))).Times(1);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb1);
   Mock::VerifyAndClearExpectations(&txcb2);
 }
@@ -2188,7 +2185,7 @@ TEST_P(
   // confirm.
   EXPECT_CALL(txcb1, onByteEvent(getAckMatcher(stream, 3))).Times(0);
   EXPECT_CALL(txcb2, onByteEvent(getAckMatcher(stream, 3))).Times(1);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb1);
   Mock::VerifyAndClearExpectations(&txcb2);
 }
@@ -2229,7 +2226,7 @@ TEST_P(QuicTransportImplTestBase, RegisterDeliveryCallbackAsyncDeliveryTx) {
   // current write offset (7) is still less than the offset requested (10)
   EXPECT_CALL(txcb1, onByteEvent(getTxMatcher(stream, 3))).Times(0);
   EXPECT_CALL(txcb2, onByteEvent(getTxMatcher(stream, 10))).Times(0);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb1);
   Mock::VerifyAndClearExpectations(&txcb2);
 
@@ -2275,7 +2272,7 @@ TEST_P(QuicTransportImplTestBase, RegisterDeliveryCallbackAsyncDeliveryAck) {
   // current write offset (7) is still less than the offset requested (10)
   EXPECT_CALL(txcb1, onByteEvent(getAckMatcher(stream, 3))).Times(0);
   EXPECT_CALL(txcb2, onByteEvent(getAckMatcher(stream, 10))).Times(0);
-  evb->loopOnce();
+  qEvb->loopOnce();
   Mock::VerifyAndClearExpectations(&txcb1);
   Mock::VerifyAndClearExpectations(&txcb2);
 
@@ -2788,7 +2785,7 @@ TEST_P(
       onConnectionWriteError(IsError(GenericApplicationErrorCode::NO_ERROR)));
   transport->notifyPendingWriteOnConnection(&wcb);
   transport->close(folly::none);
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestClose, TestNotifyPendingConnWriteOnCloseWithError) {
@@ -2805,7 +2802,7 @@ TEST_P(QuicTransportImplTestClose, TestNotifyPendingConnWriteOnCloseWithError) {
   } else {
     transport->close(folly::none);
   }
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestBase, TestNotifyPendingWriteWithActiveCallback) {
@@ -2816,7 +2813,7 @@ TEST_P(QuicTransportImplTestBase, TestNotifyPendingWriteWithActiveCallback) {
   EXPECT_TRUE(ok1.hasValue());
   auto ok2 = transport->notifyPendingWriteOnStream(stream, &wcb);
   EXPECT_EQ(ok2.error(), quic::LocalErrorCode::CALLBACK_ALREADY_INSTALLED);
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestBase, TestNotifyPendingWriteOnCloseWithoutError) {
@@ -2828,7 +2825,7 @@ TEST_P(QuicTransportImplTestBase, TestNotifyPendingWriteOnCloseWithoutError) {
           stream, IsError(GenericApplicationErrorCode::NO_ERROR)));
   transport->notifyPendingWriteOnStream(stream, &wcb);
   transport->close(folly::none);
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestClose, TestNotifyPendingWriteOnCloseWithError) {
@@ -2846,7 +2843,7 @@ TEST_P(QuicTransportImplTestClose, TestNotifyPendingWriteOnCloseWithError) {
   } else {
     transport->close(folly::none);
   }
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestBase, TestTransportCloseWithMaxPacketNumber) {
@@ -2914,7 +2911,7 @@ TEST_P(QuicTransportImplTestBase, TestGracefulCloseWithActiveStream) {
   transport->closeStream(stream);
   ASSERT_TRUE(transport->transportClosed);
 
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestBase, TestGracefulCloseWithNoActiveStream) {
@@ -3025,7 +3022,7 @@ TEST_P(QuicTransportImplTestBase, TestImmediateClose) {
       stream, StreamBuffer(IOBuf::copyBuffer("hello"), 0, false));
   EXPECT_EQ(
       transport->transportConn->streamManager->getStream(stream), nullptr);
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestBase, ResetStreamUnsetWriteCallback) {
@@ -3036,7 +3033,7 @@ TEST_P(QuicTransportImplTestBase, ResetStreamUnsetWriteCallback) {
   EXPECT_FALSE(
       transport->resetStream(stream, GenericApplicationErrorCode::UNKNOWN)
           .hasError());
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestBase, ResetAllNonControlStreams) {
@@ -3074,7 +3071,7 @@ TEST_P(QuicTransportImplTestBase, ResetAllNonControlStreams) {
 
   transport->resetNonControlStreams(
       GenericApplicationErrorCode::UNKNOWN, "bye bye");
-  evb->loopOnce();
+  qEvb->loopOnce();
 
   // Have to manually unset the read callbacks so they aren't use-after-freed.
   transport->unsetAllReadCallbacks();
@@ -3090,7 +3087,7 @@ TEST_P(QuicTransportImplTestBase, UncleanShutdownEventBase) {
   // if abruptly shutting down the eventbase we should avoid scheduling
   // any new timer.
   transport->setIdleTimeout();
-  evb.reset();
+  qEvb.reset();
 }
 
 TEST_P(QuicTransportImplTestBase, GetLocalAddressBoundSocket) {
@@ -3109,7 +3106,7 @@ TEST_P(QuicTransportImplTestBase, GetLocalAddressUnboundSocket) {
 
 TEST_P(QuicTransportImplTestBase, GetLocalAddressBadSocket) {
   auto badTransport = std::make_shared<TestQuicTransport>(
-      evb->getBackingEventBase(), nullptr, &connSetupCallback, &connCallback);
+      qEvb, nullptr, &connSetupCallback, &connCallback);
   badTransport->closeWithoutWrite();
   SocketAddress localAddr = badTransport->getLocalAddress();
   EXPECT_FALSE(localAddr.isInitialized());
@@ -3757,7 +3754,7 @@ TEST_P(QuicTransportImplTestBase, SuccessfulPing) {
   EXPECT_EQ(conn->pendingEvents.cancelPingTimeout, false);
   conn->pendingEvents.cancelPingTimeout = true;
   transport->invokeHandlePingCallbacks();
-  evb->loopOnce();
+  qEvb->loopOnce();
   EXPECT_EQ(transport->isPingTimeoutScheduled(), false);
   EXPECT_EQ(conn->pendingEvents.cancelPingTimeout, false);
 }
@@ -3805,7 +3802,7 @@ TEST_P(QuicTransportImplTestBase, HandleKnobCallbacks) {
   EXPECT_CALL(*obs2, knobFrameReceived(transport.get(), _)).Times(1);
   EXPECT_CALL(*obs3, knobFrameReceived(transport.get(), _)).Times(1);
   transport->invokeHandleKnobCallbacks();
-  evb->loopOnce();
+  qEvb->loopOnce();
   EXPECT_EQ(conn->pendingEvents.knobs.size(), 0);
 
   // detach the observer from the socket
@@ -3824,14 +3821,14 @@ TEST_P(QuicTransportImplTestBase, StreamWriteCallbackUnregister) {
   EXPECT_CALL(*wcb, onStreamWriteReady(stream, _)).Times(1);
   auto result = transport->notifyPendingWriteOnStream(stream, wcb.get());
   EXPECT_TRUE(result);
-  evb->loopOnce();
+  qEvb->loopOnce();
 
   // Set then unset
   EXPECT_CALL(*wcb, onStreamWriteReady(stream, _)).Times(0);
   result = transport->notifyPendingWriteOnStream(stream, wcb.get());
   EXPECT_TRUE(result);
   EXPECT_TRUE(transport->unregisterStreamWriteCallback(stream));
-  evb->loopOnce();
+  qEvb->loopOnce();
 
   // Set, close, unset
   result = transport->notifyPendingWriteOnStream(stream, wcb.get());
@@ -3845,7 +3842,7 @@ TEST_P(QuicTransportImplTestBase, StreamWriteCallbackUnregister) {
         wcb.reset();
       }));
   transport->close(folly::none);
-  evb->loopOnce();
+  qEvb->loopOnce();
 }
 
 TEST_P(QuicTransportImplTestBase, ObserverRemove) {
@@ -4115,50 +4112,39 @@ TEST_P(QuicTransportImplTestBase, ObserverDetachAndAttachEvb) {
   transport->addObserver(obs3.get());
 
   // check the current event base and create a new one
-  EXPECT_EQ(evb->getBackingEventBase(), transport->getEventBase());
+  EXPECT_EQ(qEvb, transport->getEventBase());
 
-  folly::EventBase backingEvb2;
-  QuicEventBase evb2(&backingEvb2);
+  folly::EventBase fEvb2;
+  std::shared_ptr<QuicEventBase> qEvb2 =
+      std::make_shared<FollyQuicEventBase>(&fEvb2);
 
   // Detach the event base evb
-  EXPECT_CALL(*obs1, evbDetach(transport.get(), evb->getBackingEventBase()))
-      .Times(0);
-  EXPECT_CALL(*obs2, evbDetach(transport.get(), evb->getBackingEventBase()))
-      .Times(1);
-  EXPECT_CALL(*obs3, evbDetach(transport.get(), evb->getBackingEventBase()))
-      .Times(1);
+  EXPECT_CALL(*obs1, evbDetach(transport.get(), qEvb.get())).Times(0);
+  EXPECT_CALL(*obs2, evbDetach(transport.get(), qEvb.get())).Times(1);
+  EXPECT_CALL(*obs3, evbDetach(transport.get(), qEvb.get())).Times(1);
   transport->detachEventBase();
   EXPECT_EQ(nullptr, transport->getEventBase());
 
   // Attach a new event base evb2
-  EXPECT_CALL(*obs1, evbAttach(transport.get(), evb2.getBackingEventBase()))
-      .Times(0);
-  EXPECT_CALL(*obs2, evbAttach(transport.get(), evb2.getBackingEventBase()))
-      .Times(1);
-  EXPECT_CALL(*obs3, evbAttach(transport.get(), evb2.getBackingEventBase()))
-      .Times(1);
-  transport->attachEventBase(evb2.getBackingEventBase());
-  EXPECT_EQ(evb2.getBackingEventBase(), transport->getEventBase());
+  EXPECT_CALL(*obs1, evbAttach(transport.get(), qEvb2.get())).Times(0);
+  EXPECT_CALL(*obs2, evbAttach(transport.get(), qEvb2.get())).Times(1);
+  EXPECT_CALL(*obs3, evbAttach(transport.get(), qEvb2.get())).Times(1);
+  transport->attachEventBase(qEvb2);
+  EXPECT_EQ(qEvb2, transport->getEventBase());
 
   // Detach the event base evb2
-  EXPECT_CALL(*obs1, evbDetach(transport.get(), evb2.getBackingEventBase()))
-      .Times(0);
-  EXPECT_CALL(*obs2, evbDetach(transport.get(), evb2.getBackingEventBase()))
-      .Times(1);
-  EXPECT_CALL(*obs3, evbDetach(transport.get(), evb2.getBackingEventBase()))
-      .Times(1);
+  EXPECT_CALL(*obs1, evbDetach(transport.get(), qEvb2.get())).Times(0);
+  EXPECT_CALL(*obs2, evbDetach(transport.get(), qEvb2.get())).Times(1);
+  EXPECT_CALL(*obs3, evbDetach(transport.get(), qEvb2.get())).Times(1);
   transport->detachEventBase();
   EXPECT_EQ(nullptr, transport->getEventBase());
 
   // Attach the original event base evb
-  EXPECT_CALL(*obs1, evbAttach(transport.get(), evb->getBackingEventBase()))
-      .Times(0);
-  EXPECT_CALL(*obs2, evbAttach(transport.get(), evb->getBackingEventBase()))
-      .Times(1);
-  EXPECT_CALL(*obs3, evbAttach(transport.get(), evb->getBackingEventBase()))
-      .Times(1);
-  transport->attachEventBase(evb->getBackingEventBase());
-  EXPECT_EQ(evb->getBackingEventBase(), transport->getEventBase());
+  EXPECT_CALL(*obs1, evbAttach(transport.get(), qEvb.get())).Times(0);
+  EXPECT_CALL(*obs2, evbAttach(transport.get(), qEvb.get())).Times(1);
+  EXPECT_CALL(*obs3, evbAttach(transport.get(), qEvb.get())).Times(1);
+  transport->attachEventBase(qEvb);
+  EXPECT_EQ(qEvb, transport->getEventBase());
 
   EXPECT_TRUE(transport->removeObserver(obs1.get()));
   EXPECT_TRUE(transport->removeObserver(obs2.get()));

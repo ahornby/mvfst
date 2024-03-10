@@ -305,7 +305,7 @@ std::deque<OutstandingPacketWrapper>::iterator getNextOutstandingPacket(
       });
 }
 
-bool hasReceivedPacketsAtLastCloseSent(
+bool hasReceivedUdpPacketsAtLastCloseSent(
     const QuicConnectionStateBase& conn) noexcept {
   const auto* initialAckState = conn.ackStates.initialAckState.get();
   const auto* handshakeAckState = conn.ackStates.handshakeAckState.get();
@@ -332,7 +332,7 @@ bool hasNotReceivedNewPacketsSinceLastCloseSent(
       appDataAckState.largestRecvdPacketNum;
 }
 
-void updateLargestReceivedPacketsAtLastCloseSent(
+void updateLargestReceivedUdpPacketsAtLastCloseSent(
     QuicConnectionStateBase& conn) noexcept {
   auto* initialAckState = conn.ackStates.initialAckState.get();
   auto* handshakeAckState = conn.ackStates.handshakeAckState.get();
@@ -350,7 +350,7 @@ void updateLargestReceivedPacketsAtLastCloseSent(
       conn.ackStates.appDataAckState.largestRecvdPacketNum;
 }
 
-bool hasReceivedPackets(const QuicConnectionStateBase& conn) noexcept {
+bool hasReceivedUdpPackets(const QuicConnectionStateBase& conn) noexcept {
   const auto* initialAckState = conn.ackStates.initialAckState.get();
   const auto* handshakeAckState = conn.ackStates.handshakeAckState.get();
   const auto& appDataAckState = conn.ackStates.appDataAckState;
@@ -403,11 +403,11 @@ uint64_t maximumConnectionIdsToIssue(const QuicConnectionStateBase& conn) {
   return maximumIdsToIssue;
 }
 
-uint64_t updateLargestReceivedPacketNum(
+uint64_t addPacketToAckState(
     QuicConnectionStateBase& conn,
     AckState& ackState,
-    PacketNum packetNum,
-    TimePoint receivedTime) {
+    const PacketNum packetNum,
+    const ReceivedUdpPacket::Timings& timings) {
   PacketNum expectedNextPacket = 0;
   if (ackState.largestRecvdPacketNum) {
     expectedNextPacket = *ackState.largestRecvdPacketNum + 1;
@@ -420,11 +420,11 @@ uint64_t updateLargestReceivedPacketNum(
     QUIC_STATS(conn.statsCallback, onDuplicatedPacketReceived);
   }
   if (ackState.largestRecvdPacketNum == packetNum) {
-    ackState.largestRecvdPacketTime = receivedTime;
+    ackState.largestRecvdPacketTime = timings.receiveTimePoint;
   }
   static_assert(Clock::is_steady, "Needs steady clock");
 
-  ackState.lastRecvdPacketInfo.assign({packetNum, receivedTime});
+  ackState.lastRecvdPacketInfo.assign({packetNum, timings});
 
   if (packetNum >= expectedNextPacket) {
     if (ackState.recvdPacketInfos.size() ==
@@ -432,7 +432,7 @@ uint64_t updateLargestReceivedPacketNum(
       ackState.recvdPacketInfos.pop_front();
     }
     ackState.recvdPacketInfos.emplace_back(
-        RecvdPacketInfo{packetNum, receivedTime});
+        WriteAckFrameState::ReceivedPacket{packetNum, timings});
   }
 
   if (expectedNextPacket) {

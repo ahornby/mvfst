@@ -58,6 +58,20 @@ class ClientHandshake : public Handshake {
   virtual const CryptoFactory& getCryptoFactory() const = 0;
 
   /**
+   * An API to get oneRttWriteCiphers on key rotation. Each call will return a
+   * one rtt write cipher using the current traffic secret and advance the
+   * traffic secret.
+   */
+  std::unique_ptr<Aead> getNextOneRttWriteCipher() override;
+
+  /**
+   * An API to get oneRttReadCiphers on key rotation. Each call will return a
+   * one rtt read cipher using the current traffic secret and advance the
+   * traffic secret.
+   */
+  std::unique_ptr<Aead> getNextOneRttReadCipher() override;
+
+  /**
    * Triggered when we have received a handshake done frame from the server.
    */
   void handshakeConfirmed() override;
@@ -83,6 +97,17 @@ class ClientHandshake : public Handshake {
   virtual bool verifyRetryIntegrityTag(
       const ConnectionId& originalDstConnId,
       const RetryPacket& retryPacket) = 0;
+
+  /*
+   * Export the underlying TLS key material.
+   * label is the label argument for the TLS exporter.
+   * context is the context value argument for the TLS exporter.
+   * keyLength is the length of the exported key.
+   */
+  virtual std::unique_ptr<std::vector<unsigned char>> getExportedKeyingMaterial(
+      const std::string& label,
+      const std::vector<unsigned char>* context,
+      uint16_t keyLength) = 0;
 
   /**
    * Returns the negotiated transport parameters chosen by the server
@@ -128,6 +153,15 @@ class ClientHandshake : public Handshake {
    */
   void setZeroRttRejectedForTest(bool rejected);
 
+  /**
+   * Given secret_n, returns secret_n+1 to be used for generating the next Aead
+   * on key updates.
+   */
+  virtual Buf getNextTrafficSecret(folly::ByteRange secret) const = 0;
+
+  Buf readTrafficSecret_;
+  Buf writeTrafficSecret_;
+
  private:
   virtual folly::Optional<CachedServerTransportParameters> connectImpl(
       folly::Optional<std::string> hostname) = 0;
@@ -135,8 +169,11 @@ class ClientHandshake : public Handshake {
   virtual EncryptionLevel getReadRecordLayerEncryptionLevel() = 0;
   virtual void processSocketData(folly::IOBufQueue& queue) = 0;
   virtual bool matchEarlyParameters() = 0;
-  virtual std::pair<std::unique_ptr<Aead>, std::unique_ptr<PacketNumberCipher>>
-  buildCiphers(CipherKind kind, folly::ByteRange secret) = 0;
+  virtual std::unique_ptr<Aead> buildAead(
+      CipherKind kind,
+      folly::ByteRange secret) = 0;
+  virtual std::unique_ptr<PacketNumberCipher> buildHeaderCipher(
+      folly::ByteRange secret) = 0;
 
   // Represents the packet type that should be used to write the data currently
   // in the stream.
@@ -153,6 +190,12 @@ class ClientHandshake : public Handshake {
   folly::IOBufQueue initialReadBuf_{folly::IOBufQueue::cacheChainLength()};
   folly::IOBufQueue handshakeReadBuf_{folly::IOBufQueue::cacheChainLength()};
   folly::IOBufQueue appDataReadBuf_{folly::IOBufQueue::cacheChainLength()};
+
+  // This variable is incremented every time a read traffic secret is rotated,
+  // and decremented for the write secret. Its value should be
+  // between -1 and 1. A value outside of this range indicates that the
+  // transport's read and write ciphers are likely out of sync.
+  int8_t trafficSecretSync_{0};
 
   folly::exception_wrapper error_;
 };

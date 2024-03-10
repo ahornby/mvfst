@@ -31,16 +31,16 @@ Buf packetToBuf(
   auto buf = folly::IOBuf::create(0);
   // This does not matter.
   PacketNum num = 10;
-  if (packet.header) {
-    buf->prependChain(packet.header->clone());
+  if (!packet.header.empty()) {
+    buf->prependChain(packet.header.clone());
   }
   std::unique_ptr<folly::IOBuf> body = folly::IOBuf::create(0);
-  if (packet.body) {
-    body = packet.body->clone();
+  if (!packet.body.empty()) {
+    body = packet.body.clone();
   }
-  if (aead && packet.header) {
+  if (aead && !packet.header.empty()) {
     auto bodySize = body->computeChainDataLength();
-    body = aead->inplaceEncrypt(std::move(body), packet.header.get(), num);
+    body = aead->inplaceEncrypt(std::move(body), &packet.header, num);
     EXPECT_GT(body->computeChainDataLength(), bodySize);
   }
   if (body) {
@@ -257,7 +257,7 @@ TEST_P(QuicPacketBuilderTest, ShortHeaderRegularPacket) {
   size_t expectedOutputSize =
       sizeof(Sample) + kMaxPacketNumEncodingSize - encodedPacketNum.length;
   // We wrote less than sample bytes into the packet, so we'll pad it to sample
-  EXPECT_EQ(builtOut.body->computeChainDataLength(), expectedOutputSize);
+  EXPECT_EQ(builtOut.body.computeChainDataLength(), expectedOutputSize);
   auto resultBuf = packetToBuf(builtOut);
 
   auto& resultShortHeader = *resultRegularPacket.header.asShort();
@@ -314,27 +314,25 @@ TEST_P(QuicPacketBuilderTest, EnforcePacketSizeWithCipherOverhead) {
 
   auto param = GetParam();
   if (param == TestFlavor::Regular) {
-    EXPECT_EQ(builtOut.body->isManagedOne(), true);
+    EXPECT_EQ(builtOut.body.isManagedOne(), true);
     RegularSizeEnforcedPacketBuilder sizeEnforcedBuilder(
         std::move(builtOut), enforcedSize, cipherOverhead);
     EXPECT_TRUE(sizeEnforcedBuilder.canBuildPacket());
     auto out = std::move(sizeEnforcedBuilder).buildPacket();
     EXPECT_EQ(
-        out.header->computeChainDataLength() +
-            out.body->computeChainDataLength(),
+        out.header.computeChainDataLength() + out.body.computeChainDataLength(),
         enforcedSize - cipherOverhead);
     auto buf = packetToBuf(out, aead_);
     EXPECT_EQ(buf->computeChainDataLength(), enforcedSize);
 
   } else {
-    EXPECT_EQ(builtOut.body->isManagedOne(), false);
+    EXPECT_EQ(builtOut.body.isManagedOne(), false);
     InplaceSizeEnforcedPacketBuilder sizeEnforcedBuilder(
         *simpleBufAccessor_, std::move(builtOut), enforcedSize, cipherOverhead);
     EXPECT_TRUE(sizeEnforcedBuilder.canBuildPacket());
     auto out = std::move(sizeEnforcedBuilder).buildPacket();
     EXPECT_EQ(
-        out.header->computeChainDataLength() +
-            out.body->computeChainDataLength(),
+        out.header.computeChainDataLength() + out.body.computeChainDataLength(),
         enforcedSize - cipherOverhead);
     auto buf = packetToBuf(out, aead_);
     EXPECT_EQ(buf->computeChainDataLength(), enforcedSize);
@@ -396,7 +394,7 @@ TEST_P(QuicPacketBuilderTest, TestPaddingAccountsForCipherOverhead) {
       sizeof(Sample) + kMaxPacketNumEncodingSize - encodedPacketNum.length;
   EXPECT_EQ(resultRegularPacket.frames.size(), 1);
   EXPECT_EQ(
-      builtOut.body->computeChainDataLength(),
+      builtOut.body.computeChainDataLength(),
       expectedOutputSize - cipherOverhead);
 }
 
@@ -422,7 +420,7 @@ TEST_P(QuicPacketBuilderTest, TestPaddingRespectsRemainingBytes) {
   // We should have padded the remaining bytes with Padding frames.
   EXPECT_EQ(resultRegularPacket.frames.size(), 1);
   EXPECT_EQ(
-      builtOut.body->computeChainDataLength(), totalPacketSize - headerSize);
+      builtOut.body.computeChainDataLength(), totalPacketSize - headerSize);
 }
 
 TEST_F(QuicPacketBuilderTest, PacketBuilderWrapper) {
@@ -462,7 +460,7 @@ TEST_P(QuicPacketBuilderTest, LongHeaderBytesCounting) {
       estimatedHeaderBytes, expectedWrittenHeaderFieldLen + kMaxPacketLenSize);
   writeFrame(PaddingFrame(), *builder);
   EXPECT_LE(
-      std::move(*builder).buildPacket().header->computeChainDataLength(),
+      std::move(*builder).buildPacket().header.computeChainDataLength(),
       estimatedHeaderBytes);
 }
 
@@ -480,7 +478,7 @@ TEST_P(QuicPacketBuilderTest, ShortHeaderBytesCounting) {
   auto headerBytes = builder->getHeaderBytes();
   writeFrame(PaddingFrame(), *builder);
   EXPECT_EQ(
-      std::move(*builder).buildPacket().header->computeChainDataLength(),
+      std::move(*builder).buildPacket().header.computeChainDataLength(),
       headerBytes);
 }
 
@@ -546,8 +544,8 @@ TEST_F(QuicPacketBuilderTest, BuildTwoInplaces) {
   ASSERT_TRUE(builtOut2.packet.frames[0].asPaddingFrame());
   EXPECT_EQ(builtOut2.packet.frames[0].asPaddingFrame()->numFrames, 40);
 
-  EXPECT_EQ(builtOut2.header->length(), builtOut1.header->length());
-  EXPECT_EQ(20, builtOut2.body->length() - builtOut1.body->length());
+  EXPECT_EQ(builtOut2.header.length(), builtOut1.header.length());
+  EXPECT_EQ(20, builtOut2.body.length() - builtOut1.body.length());
 }
 
 TEST_F(QuicPacketBuilderTest, InplaceBuilderShorterHeaderBytes) {
@@ -646,15 +644,26 @@ TEST_F(QuicPacketBuilderTest, RetryPacketValid) {
   auto srcConnId = getTestConnectionId(0), dstConnId = getTestConnectionId(1);
   auto quicVersion = static_cast<QuicVersion>(0xff00001d);
   std::string retryToken = "token";
-  Buf integrityTag = folly::IOBuf::copyBuffer(
-      "\xaa\xbb\xcc\xdd\xee\xff\x11\x22\x33\x44\x55\x66\x77\x88\x99\x11");
+  RetryPacket::IntegrityTagType integrityTag = {
+      0xaa,
+      0xbb,
+      0xcc,
+      0xdd,
+      0xee,
+      0xff,
+      0x11,
+      0x22,
+      0x33,
+      0x44,
+      0x55,
+      0x66,
+      0x77,
+      0x88,
+      0x99,
+      0x11};
 
   RetryPacketBuilder builder(
-      srcConnId,
-      dstConnId,
-      quicVersion,
-      std::string(retryToken),
-      integrityTag->clone());
+      srcConnId, dstConnId, quicVersion, std::string(retryToken), integrityTag);
 
   EXPECT_TRUE(builder.canBuildPacket());
   Buf retryPacket = std::move(builder).buildPacket();
@@ -701,7 +710,10 @@ TEST_F(QuicPacketBuilderTest, RetryPacketValid) {
   // integrity tag
   Buf integrityTagObtained;
   cursor.clone(integrityTagObtained, kRetryIntegrityTagLen);
-  EXPECT_TRUE(folly::IOBufEqualTo()(integrityTagObtained, integrityTag));
+  EXPECT_TRUE(folly::IOBufEqualTo()(
+      *integrityTagObtained,
+      folly::IOBuf::wrapBufferAsValue(
+          integrityTag.data(), integrityTag.size())));
 }
 
 TEST_F(QuicPacketBuilderTest, RetryPacketGiganticToken) {
@@ -711,15 +723,26 @@ TEST_F(QuicPacketBuilderTest, RetryPacketGiganticToken) {
   for (uint32_t i = 0; i < 500; i++) {
     retryToken += "aaaaaaaaaa";
   }
-  Buf integrityTag = folly::IOBuf::copyBuffer(
-      "\xaa\xbb\xcc\xdd\xee\xff\x11\x22\x33\x44\x55\x66\x77\x88\x99\x11");
+  RetryPacket::IntegrityTagType integrityTag = {
+      0xaa,
+      0xbb,
+      0xcc,
+      0xdd,
+      0xee,
+      0xff,
+      0x11,
+      0x22,
+      0x33,
+      0x44,
+      0x55,
+      0x66,
+      0x77,
+      0x88,
+      0x99,
+      0x11};
 
   RetryPacketBuilder builder(
-      srcConnId,
-      dstConnId,
-      quicVersion,
-      std::string(retryToken),
-      integrityTag->clone());
+      srcConnId, dstConnId, quicVersion, std::move(retryToken), integrityTag);
 
   EXPECT_FALSE(builder.canBuildPacket());
 }

@@ -76,7 +76,7 @@ quic::CongestionControlConfig parseCongestionControlConfig(
        {"leaveHeadroomForCwndLimited", ccaConfig.leaveHeadroomForCwndLimited},
        {"ignoreInflightHi", ccaConfig.ignoreInflightHi},
        {"ignoreLoss", ccaConfig.ignoreLoss},
-       {"advanceCycleAfterStartup", ccaConfig.advanceCycleAfterStartup}}};
+       {"enableRenoCoexistence", ccaConfig.enableRenoCoexistence}}};
 
   for (const auto& [name, field] : boolFields) {
     if (auto val = ccaConfigDyn.get_ptr(name)) {

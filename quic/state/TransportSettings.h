@@ -77,8 +77,8 @@ struct CongestionControlConfig {
   bool ignoreLoss{false};
 
   // Used by: BBR2
-  // Whether BBR2 should advance the cycle count on exiting startup
-  bool advanceCycleAfterStartup{true};
+  // Whether BBR2 should enable reno coexistence.
+  bool enableRenoCoexistence{false};
 };
 
 struct DatagramConfig {
@@ -326,6 +326,25 @@ struct TransportSettings {
   uint64_t maxReceiveTimestampsPerAckStored{kMaxReceivedPktsTimestampsStored};
   // Close the connection completely if a migration occurs during the handshake.
   bool closeIfMigrationDuringHandshake{true};
+  // Whether to use writable bytes to apply app backpressure via the callbacks
+  // for the max writable on stream or connection. The value is a multiplier
+  // for the writable bytes given in the callback, which may be useful for
+  // allowing cwnd growth. 0 disables. The amount given to callbacks has the
+  // current amount of stream bytes buffered subtracted from it.
+  uint8_t backpressureHeadroomFactor{0};
+
+  // Whether to initiate key updates
+  bool initiateKeyUpdate{false};
+  // How many packets to send before initiating the first key update.
+  // This is reset to folly::none after the first key update is initiated.
+  folly::Optional<uint64_t> firstKeyUpdatePacketCount{
+      kFirstKeyUpdatePacketCount};
+  // How many packets to send before initiating periodic key updates
+  uint64_t keyUpdatePacketCountInterval{kDefaultKeyUpdatePacketCountInterval};
+  // Whether to terminate the connection when a peer initiates a key update.
+  // TODO: Remove this. This is a temporary measure to gradually roll out key
+  // update support.
+  bool rejectIncomingKeyUpdates{false};
 };
 
 } // namespace quic

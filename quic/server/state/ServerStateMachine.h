@@ -44,7 +44,7 @@ enum ServerState {
 struct ServerEvents {
   struct ReadData {
     folly::SocketAddress peer;
-    ReceivedPacket udpPacket;
+    ReceivedUdpPacket udpPacket;
   };
 
   struct Close {};
@@ -219,24 +219,13 @@ bool validateAndUpdateSourceToken(
 
 void updateWritableByteLimitOnRecvPacket(QuicServerConnectionState& conn);
 
-void updateTransportParamsFromTicket(
+void maybeUpdateTransportFromAppToken(
     QuicServerConnectionState& conn,
-    uint64_t idleTimeout,
-    uint64_t maxRecvPacketSize,
-    uint64_t initialMaxData,
-    uint64_t initialMaxStreamDataBidiLocal,
-    uint64_t initialMaxStreamDataBidiRemote,
-    uint64_t initialMaxStreamDataUni,
-    uint64_t initialMaxStreamsBidi,
-    uint64_t initialMaxStreamsUni,
-    folly::Optional<uint64_t> maybeCwndHintBytes);
+    const folly::Optional<Buf>& appToken);
 
 void onConnectionMigration(
     QuicServerConnectionState& conn,
     const folly::SocketAddress& newPeerAddress,
     bool isIntentional = false);
-
-std::vector<TransportParameter> setSupportedExtensionTransportParameters(
-    QuicServerConnectionState& conn);
 
 } // namespace quic

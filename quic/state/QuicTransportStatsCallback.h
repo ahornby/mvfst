@@ -163,6 +163,12 @@ class QuicTransportStatsCallback {
 
   virtual void onConnectionIdCreated(size_t encodedTimes) = 0;
 
+  virtual void onKeyUpdateAttemptInitiated() = 0;
+
+  virtual void onKeyUpdateAttemptReceived() = 0;
+
+  virtual void onKeyUpdateAttemptSucceeded() = 0;
+
   static const char* toString(SocketErrorType errorType) {
     switch (errorType) {
       case SocketErrorType::AGAIN:
@@ -219,7 +225,8 @@ class QuicTransportStatsCallbackFactory {
   if (statsCallback) {                                                      \
     folly::invoke(                                                          \
         &QuicTransportStatsCallback::method, statsCallback, ##__VA_ARGS__); \
-  }
+  }                                                                         \
+  static_assert(true, "semicolon required")
 
 #define QUIC_STATS_FOR_EACH(iterBegin, iterEnd, statsCallback, method, ...)   \
   if (statsCallback) {                                                        \
@@ -227,5 +234,7 @@ class QuicTransportStatsCallbackFactory {
       folly::invoke(                                                          \
           &QuicTransportStatsCallback::method, statsCallback, ##__VA_ARGS__); \
     });                                                                       \
-  }
+  }                                                                           \
+  static_assert(true, "semicolon required")
+
 } // namespace quic

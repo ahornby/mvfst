@@ -14,8 +14,7 @@
 #include <quic/api/test/Mocks.h>
 #include <quic/client/QuicClientTransport.h>
 #include <quic/codec/DefaultConnectionIdAlgo.h>
-#include <quic/common/QuicAsyncUDPSocketWrapper.h>
-#include <quic/common/QuicEventBase.h>
+#include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/test/TestClientUtils.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/common/testutil/MockAsyncUDPSocket.h>
@@ -45,8 +44,8 @@ class TestingQuicClientTransport : public QuicClientTransport {
   };
 
   TestingQuicClientTransport(
-      folly::EventBase* evb,
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+      std::shared_ptr<QuicEventBase> evb,
+      std::unique_ptr<QuicAsyncUDPSocket> socket,
       std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
       size_t connIdSize = kDefaultConnectionIdSize,
       bool useConnectionEndWithErrorCallback = false)
@@ -115,8 +114,8 @@ class TestingQuicClientTransport : public QuicClientTransport {
     return closeState_ == CloseState::CLOSED;
   }
 
-  bool isDraining() const {
-    return drainTimeout_.isScheduled();
+  bool isDraining() {
+    return drainTimeout_.isTimerCallbackScheduled();
   }
 
   auto& serverInitialParamsSet() {
@@ -144,7 +143,7 @@ class TestingQuicClientTransport : public QuicClientTransport {
     destructionCallback_ = std::move(destructionCallback);
   }
 
-  void invokeOnNotifyDataAvailable(QuicAsyncUDPSocketWrapper& sock) {
+  void invokeOnNotifyDataAvailable(QuicAsyncUDPSocket& sock) {
     onNotifyDataAvailable(sock);
   }
 
@@ -228,10 +227,17 @@ class FakeOneRttHandshakeLayer : public FizzClientHandshake {
 
   void setOneRttWriteCipher(std::unique_ptr<Aead> oneRttWriteCipher) {
     oneRttWriteCipher_ = std::move(oneRttWriteCipher);
+    writeTrafficSecret_ = folly::IOBuf::copyBuffer(getRandSecret());
   }
 
   void setOneRttReadCipher(std::unique_ptr<Aead> oneRttReadCipher) {
     getClientConn()->readCodec->setOneRttReadCipher(
+        std::move(oneRttReadCipher));
+    readTrafficSecret_ = folly::IOBuf::copyBuffer(getRandSecret());
+  }
+
+  void setNextOneRttReadCipher(std::unique_ptr<Aead> oneRttReadCipher) {
+    getClientConn()->readCodec->setNextOneRttReadCipher(
         std::move(oneRttReadCipher));
   }
 
@@ -314,6 +320,10 @@ class FakeOneRttHandshakeLayer : public FizzClientHandshake {
     return params_;
   }
 
+  Buf getNextTrafficSecret(folly::ByteRange /*secret*/) const override {
+    return folly::IOBuf::copyBuffer(getRandSecret());
+  }
+
   void triggerOnNewCachedPsk() {
     fizz::client::NewCachedPsk psk;
     onNewCachedPsk(psk);
@@ -356,16 +366,20 @@ class FakeOneRttHandshakeLayer : public FizzClientHandshake {
   bool matchEarlyParameters() override {
     throw std::runtime_error("matchEarlyParameters not implemented");
   }
-  std::pair<std::unique_ptr<Aead>, std::unique_ptr<PacketNumberCipher>>
-  buildCiphers(CipherKind, folly::ByteRange) override {
-    throw std::runtime_error("buildCiphers not implemented");
+  std::unique_ptr<Aead> buildAead(CipherKind, folly::ByteRange) override {
+    return createNoOpAead();
+  }
+  std::unique_ptr<PacketNumberCipher> buildHeaderCipher(
+      folly::ByteRange) override {
+    throw std::runtime_error("buildHeaderCipher not implemented");
   }
 };
 
 class QuicClientTransportTestBase : public virtual testing::Test {
  public:
   QuicClientTransportTestBase()
-      : eventbase_(std::make_unique<folly::EventBase>()) {}
+      : eventbase_(std::make_unique<folly::EventBase>()),
+        qEvb_(std::make_shared<FollyQuicEventBase>(eventbase_.get())) {}
 
   virtual ~QuicClientTransportTestBase() = default;
 
@@ -399,11 +413,11 @@ class QuicClientTransportTestBase : public virtual testing::Test {
   void SetUp() {
     auto socket =
         std::make_unique<testing::NiceMock<quic::test::MockAsyncUDPSocket>>(
-            eventbase_.get());
+            qEvb_);
     sock = socket.get();
 
     client = TestingQuicClientTransport::newClient<TestingQuicClientTransport>(
-        eventbase_.get(), std::move(socket), getFizzClientContext());
+        qEvb_, std::move(socket), getFizzClientContext());
     destructionCallback =
         std::make_shared<TestingQuicClientTransport::DestructionCallback>();
     client->setDestructionCallback(destructionCallback);
@@ -514,12 +528,14 @@ class QuicClientTransportTestBase : public virtual testing::Test {
 
   virtual void setFakeHandshakeCiphers() {
     auto readAead = test::createNoOpAead();
+    auto nextReadAead = test::createNoOpAead();
     auto writeAead = test::createNoOpAead();
     auto handshakeReadAead = test::createNoOpAead();
     auto handshakeWriteAead = test::createNoOpAead();
     mockClientHandshake->setHandshakeReadCipher(std::move(handshakeReadAead));
     mockClientHandshake->setHandshakeWriteCipher(std::move(handshakeWriteAead));
     mockClientHandshake->setOneRttReadCipher(std::move(readAead));
+    mockClientHandshake->setNextOneRttReadCipher(std::move(nextReadAead));
     mockClientHandshake->setOneRttWriteCipher(std::move(writeAead));
 
     mockClientHandshake->setHandshakeReadHeaderCipher(
@@ -534,7 +550,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
 
   virtual void setUpSocketExpectations() {
     EXPECT_CALL(*sock, setReuseAddr(false));
-    EXPECT_CALL(*sock, bind(testing::_, testing::_));
+    EXPECT_CALL(*sock, bind(testing::_));
     EXPECT_CALL(*sock, setDFAndTurnOffPMTU());
     EXPECT_CALL(*sock, setErrMessageCallback(client.get()));
     EXPECT_CALL(*sock, resumeRead(client.get()));
@@ -549,7 +565,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
     setUpSocketExpectations();
     client->start(&clientConnSetupCallback, &clientConnCallback);
     setConnectionIds();
-    EXPECT_TRUE(client->idleTimeout().isScheduled());
+    EXPECT_TRUE(client->idleTimeout().isTimerCallbackScheduled());
 
     EXPECT_EQ(socketWrites.size(), 1);
     EXPECT_TRUE(
@@ -902,8 +918,9 @@ class QuicClientTransportTestBase : public virtual testing::Test {
   std::shared_ptr<TestingQuicClientTransport::DestructionCallback>
       destructionCallback;
   std::unique_ptr<folly::EventBase> eventbase_;
+  std::shared_ptr<FollyQuicEventBase> qEvb_;
   folly::SocketAddress serverAddr{"127.0.0.1", 443};
-  QuicAsyncUDPSocketType::ReadCallback* networkReadCallback{nullptr};
+  QuicAsyncUDPSocket::ReadCallback* networkReadCallback{nullptr};
   FakeOneRttHandshakeLayer* mockClientHandshake;
   std::shared_ptr<FizzClientQuicHandshakeContext> fizzClientContext;
   std::shared_ptr<TestingQuicClientTransport> client;

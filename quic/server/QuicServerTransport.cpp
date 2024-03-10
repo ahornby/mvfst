@@ -18,20 +18,21 @@
 #include <quic/common/TransportKnobs.h>
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 
 namespace quic {
 
 QuicServerTransport::QuicServerTransport(
-    folly::EventBase* evb,
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> sock,
+    std::shared_ptr<QuicEventBase> evb,
+    std::unique_ptr<QuicAsyncUDPSocket> sock,
     folly::MaybeManagedPtr<ConnectionSetupCallback> connSetupCb,
     folly::MaybeManagedPtr<ConnectionCallback> connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     std::unique_ptr<CryptoFactory> cryptoFactory,
     PacketNum startingPacketNum)
     : QuicServerTransport(
-          evb,
+          std::move(evb),
           std::move(sock),
           connSetupCb,
           connStreamsCb,
@@ -41,15 +42,15 @@ QuicServerTransport::QuicServerTransport(
 }
 
 QuicServerTransport::QuicServerTransport(
-    folly::EventBase* evb,
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> sock,
+    std::shared_ptr<QuicEventBase> evb,
+    std::unique_ptr<QuicAsyncUDPSocket> sock,
     folly::MaybeManagedPtr<ConnectionSetupCallback> connSetupCb,
     folly::MaybeManagedPtr<ConnectionCallback> connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     std::unique_ptr<CryptoFactory> cryptoFactory,
     bool useConnectionEndWithErrorCallback)
     : QuicTransportBase(
-          evb,
+          std::move(evb),
           std::move(sock),
           useConnectionEndWithErrorCallback),
       ctx_(std::move(ctx)),
@@ -84,14 +85,16 @@ QuicServerTransport::~QuicServerTransport() {
 
 QuicServerTransport::Ptr QuicServerTransport::make(
     folly::EventBase* evb,
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> sock,
+    std::unique_ptr<FollyAsyncUDPSocketAlias> sock,
     const folly::MaybeManagedPtr<ConnectionSetupCallback>& connSetupCb,
     const folly::MaybeManagedPtr<ConnectionCallback>& connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     bool useConnectionEndWithErrorCallback) {
+  auto qEvb = std::make_shared<FollyQuicEventBase>(evb);
+  auto qSock = std::make_unique<FollyQuicAsyncUDPSocket>(qEvb, std::move(sock));
   return std::make_shared<QuicServerTransport>(
-      evb,
-      std::move(sock),
+      std::move(qEvb),
+      std::move(qSock),
       connSetupCb,
       connStreamsCb,
       ctx,
@@ -123,6 +126,9 @@ void QuicServerTransport::setTransportStatsCallback(
     QuicTransportStatsCallback* statsCallback) noexcept {
   if (conn_) {
     conn_->statsCallback = statsCallback;
+    if (conn_->readCodec) {
+      conn_->readCodec->setConnectionStatsCallback(statsCallback);
+    }
   }
 }
 
@@ -144,11 +150,11 @@ void QuicServerTransport::setServerConnectionIdRejector(
 
 void QuicServerTransport::onReadData(
     const folly::SocketAddress& peer,
-    ReceivedPacket&& udpPacket) {
+    ReceivedUdpPacket&& udpPacket) {
   ServerEvents::ReadData readData;
   readData.peer = peer;
   readData.udpPacket = std::move(udpPacket);
-  bool waitingForFirstPacket = !hasReceivedPackets(*conn_);
+  bool waitingForFirstPacket = !hasReceivedUdpPackets(*conn_);
   uint64_t prevWritableBytes = serverConn_->writableBytesLimit
       ? *serverConn_->writableBytesLimit
       : std::numeric_limits<uint64_t>::max();
@@ -164,7 +170,7 @@ void QuicServerTransport::onReadData(
         shared_from_this(), *conn_->serverConnectionId);
   }
   if (connSetupCallback_ && waitingForFirstPacket &&
-      hasReceivedPackets(*conn_)) {
+      hasReceivedUdpPackets(*conn_)) {
     connSetupCallback_->onFirstPeerPacketProcessed();
   }
 
@@ -194,7 +200,7 @@ void QuicServerTransport::accept() {
   updateFlowControlStateWithSettings(
       conn_->flowControlState, conn_->transportSettings);
   serverConn_->serverHandshakeLayer->initialize(
-      qEvbPtr_.load()->getBackingEventBase(),
+      getFollyEventbase(),
       this,
       std::make_unique<DefaultAppTokenValidator>(serverConn_));
 }
@@ -208,16 +214,16 @@ void QuicServerTransport::writeData() {
   const ConnectionId& destConnId = *conn_->clientConnectionId;
   if (closeState_ == CloseState::CLOSED) {
     if (conn_->peerConnectionError &&
-        hasReceivedPacketsAtLastCloseSent(*conn_)) {
+        hasReceivedUdpPacketsAtLastCloseSent(*conn_)) {
       // The peer sent us an error, we are in draining state now.
       return;
     }
-    if (hasReceivedPacketsAtLastCloseSent(*conn_) &&
+    if (hasReceivedUdpPacketsAtLastCloseSent(*conn_) &&
         hasNotReceivedNewPacketsSinceLastCloseSent(*conn_)) {
       // We did not receive any new packets, do not sent a new close frame.
       return;
     }
-    updateLargestReceivedPacketsAtLastCloseSent(*conn_);
+    updateLargestReceivedUdpPacketsAtLastCloseSent(*conn_);
     if (conn_->oneRttWriteCipher) {
       CHECK(conn_->oneRttWriteHeaderCipher);
       writeShortClose(
@@ -264,6 +270,7 @@ void QuicServerTransport::writeData() {
   // use.
   SCOPE_EXIT {
     conn_->pendingEvents.numProbePackets = {};
+    maybeInitiateKeyUpdate(*conn_);
   };
   if (conn_->initialWriteCipher) {
     auto& initialCryptoStream =
@@ -440,7 +447,7 @@ void QuicServerTransport::onCryptoEventAvailable() noexcept {
       VLOG(10) << "Got crypto event after connection closed " << *this;
       return;
     }
-    FOLLY_MAYBE_UNUSED auto self = sharedGuard();
+    [[maybe_unused]] auto self = sharedGuard();
     updateHandshakeState(*serverConn_);
     processPendingData(false);
     // pending data may contain connection close
@@ -564,10 +571,8 @@ bool QuicServerTransport::shouldWriteNewSessionTicket() {
 }
 
 void QuicServerTransport::maybeWriteNewSessionTicket() {
-  if (shouldWriteNewSessionTicket() && !ctx_->getSendNewSessionTicket() &&
+  if (shouldWriteNewSessionTicket() &&
       serverConn_->serverHandshakeLayer->isHandshakeDone()) {
-    VLOG(7) << "Writing a new session ticket with cwnd="
-            << conn_->congestionController->getCongestionWindow();
     if (conn_->qLogger) {
       conn_->qLogger->addTransportStateUpdate(kWriteNst);
     }
@@ -575,6 +580,8 @@ void QuicServerTransport::maybeWriteNewSessionTicket() {
     folly::Optional<uint64_t> cwndHint = folly::none;
     if (conn_->transportSettings.includeCwndHintsInSessionTicket &&
         conn_->congestionController) {
+      VLOG(7) << "Writing a new session ticket with cwnd="
+              << conn_->congestionController->getCongestionWindow();
       cwndHint = conn_->congestionController->getCongestionWindow();
       newSessionTicketWrittenCwndHint_ = cwndHint;
     }
@@ -681,6 +688,9 @@ void QuicServerTransport::maybeNotifyTransportReady() {
     }
     transportReadyNotified_ = true;
     connSetupCallback_->onTransportReady();
+
+    // This is a new connection. Update QUIC Stats
+    QUIC_STATS(conn_->statsCallback, onNewConnection);
   }
 }
 
@@ -1091,6 +1101,22 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
             !static_cast<bool>(val);
         VLOG(3) << "CONNECTION_MIGRATION KnobParam received: "
                 << static_cast<bool>(val);
+      });
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::KEY_UPDATE_INTERVAL),
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
+        CHECK(serverTransport);
+        auto val = std::get<uint64_t>(value);
+        if (val < 1000 || val > 8ul * 1000 * 1000) {
+          std::string errMsg = fmt::format(
+              "KEY_UPDATE_INTERVAL KnobParam received with invalid value: {}",
+              val);
+          throw std::runtime_error(errMsg);
+        }
+        auto server_conn = serverTransport->serverConn_;
+        server_conn->transportSettings.initiateKeyUpdate = val > 0;
+        server_conn->transportSettings.keyUpdatePacketCountInterval = val;
+        VLOG(3) << "KEY_UPDATE_INTERVAL KnobParam received: " << val;
       });
 }
 

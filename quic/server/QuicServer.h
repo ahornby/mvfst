@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include <condition_variable>
 #include <memory>
 #include <vector>
 
@@ -138,18 +137,14 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
    * Options are being set before and after bind, and not at the time of
    * invoking this function.
    */
-  void setSocketOptions(const folly::SocketOptionMap& options) noexcept {
-    socketOptions_ = options;
-  }
+  void setSocketOptions(const folly::SocketOptionMap& options) noexcept;
 
   /**
    * Sets whether the underlying socket should set the IPV6_ONLY socket option
    * or not. If set to false, IPv4-mapped IPv6 addresses will be enabled on the
    * socket.
    */
-  void setBindV6Only(bool bindV6Only) {
-    bindOptions_.bindV6Only = bindV6Only;
-  }
+  void setBindV6Only(bool bindV6Only);
 
   /**
    * Set the server id of the quic server.
@@ -220,19 +215,6 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
    * Blocks the calling thread until isInitialized() is true
    */
   void waitUntilInitialized();
-
-  void handleWorkerError(LocalErrorCode error) override;
-
-  /**
-   * Routes the given data for the given client to the correct worker that may
-   * have the state for the connection associated with the given data and client
-   */
-  void routeDataToWorker(
-      const folly::SocketAddress& client,
-      RoutingData&& routingData,
-      NetworkData&& networkData,
-      folly::Optional<QuicVersion> quicVersion,
-      bool isForwardedData = false) override;
 
   /**
    * Set the transport factory for the worker associated with the given
@@ -370,6 +352,29 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
  private:
   QuicServer();
 
+  /**
+   * Routes the given data for the given client to the correct worker that may
+   * have the state for the connection associated with the given data and client
+   */
+  void routeDataToWorker(
+      const folly::SocketAddress& client,
+      RoutingData&& routingData,
+      NetworkData&& networkData,
+      folly::Optional<QuicVersion> quicVersion,
+      folly::EventBase* workerEvb,
+      bool isForwardedData = false) override;
+
+  void handleWorkerError(LocalErrorCode error) override;
+
+  using MaybeOwnedEvbPtr =
+      std::unique_ptr<folly::IOExecutor, void (*)(folly::IOExecutor*)>;
+
+  // initializes a QuicServerWorker per evb.
+  void initializeImpl(
+      const folly::SocketAddress& address,
+      std::vector<MaybeOwnedEvbPtr> evbs,
+      bool useDefaultTransport = false);
+
   struct EventBaseBackendDetails {
     std::unique_ptr<folly::EventBaseBackendBase> (*factory)();
     bool supportsRecvmsgMultishot = false;
@@ -377,9 +382,7 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
   static EventBaseBackendDetails getEventBaseBackendDetails();
 
   // helper function to initialize workers
-  void initializeWorkers(
-      const std::vector<folly::EventBase*>& evbs,
-      bool useDefaultTransport);
+  void initializeWorkers(bool useDefaultTransport);
 
   std::unique_ptr<QuicServerWorker> newWorkerWithoutSocket();
 
@@ -389,9 +392,7 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
   // helper method to run the given function in all worker synchronously
   void runOnAllWorkersSync(const std::function<void(QuicServerWorker*)>& func);
 
-  void bindWorkersToSocket(
-      const folly::SocketAddress& address,
-      const std::vector<folly::EventBase*>& evbs);
+  void bindWorkersToSocket(const folly::SocketAddress& address);
 
   std::vector<QuicVersion> supportedVersions_{{
       QuicVersion::MVFST,
@@ -408,9 +409,11 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
   TransportSettings transportSettings_;
   std::mutex startMutex_;
   std::atomic<bool> initialized_{false};
-  std::condition_variable startCv_;
   std::atomic<bool> takeoverHandlerInitialized_{false};
-  std::vector<std::unique_ptr<folly::ScopedEventBaseThread>> workerEvbs_;
+
+  // stores all the worker evbs which may be owned (i.e. ScopedEventBaseThread)
+  // or unowned (i.e. folly::EventBase*)
+  folly::Synchronized<std::vector<MaybeOwnedEvbPtr>> workerEvbs_;
 
   std::vector<std::unique_ptr<QuicServerWorker>> workers_;
   // Thread local pointer to QuicServerWorker. This is useful to avoid
@@ -459,11 +462,26 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
   std::function<int()> unfinishedHandshakeLimitFn_{[]() { return 1048576; }};
 
   // Options to AsyncUDPSocket::bind, only controls IPV6_ONLY currently.
-  QuicAsyncUDPSocketWrapper::BindOptions bindOptions_;
+  FollyAsyncUDPSocketAlias::BindOptions bindOptions_;
 
   // set by getEventBaseBackend if multishot callback is
   // supported
   bool backendSupportsMultishotCallback_{false};
+
+  // flag to ensure baton is only posted once
+  folly::once_flag startDone_;
+  // baton used to block in ::waitUntilInitialized – posted via shutdown path or
+  // last worker to have been initialized
+  folly::Baton<> startDoneBaton_;
+
+  /**
+   * QuicServer does not support multi-threaded/concurrent access. mainThreadId_
+   * is initialized to the id of the thread that constructed the QuicServer and
+   * all member methods check the invariant that they are invoked in
+   * mainThreadId_. This is temporary until we move all member methods that
+   * shouldn't be invoked after initialization into the constructor.
+   */
+  const std::thread::id mainThreadId_{};
 };
 
 } // namespace quic

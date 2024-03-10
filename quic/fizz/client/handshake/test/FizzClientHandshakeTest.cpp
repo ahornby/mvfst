@@ -5,12 +5,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <fizz/protocol/ech/Decrypter.h>
+#include <folly/FBString.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <condition_variable>
 #include <mutex>
 
+#include <fizz/client/test/Mocks.h>
 #include <fizz/crypto/test/TestUtil.h>
 #include <fizz/protocol/clock/test/Mocks.h>
 #include <fizz/protocol/test/Mocks.h>
@@ -45,8 +48,7 @@ class ClientHandshakeTest : public Test, public boost::static_visitor<> {
   ClientHandshakeTest() {}
 
   virtual void setupClientAndServerContext() {
-    clientCtx = std::make_shared<fizz::client::FizzClientContext>();
-    clientCtx->setClock(std::make_shared<fizz::test::MockClock>());
+    clientCtx = createClientCtx();
   }
 
   QuicVersion getVersion() {
@@ -75,6 +77,7 @@ class ClientHandshakeTest : public Test, public boost::static_visitor<> {
     folly::ssl::init();
     dg.reset(new DelayedHolder());
     serverCtx = ::quic::test::createServerCtx();
+    serverCtx->setECHDecrypter(getECHDecrypter());
     serverCtx->setOmitEarlyRecordLayer(true);
     serverCtx->setClock(std::make_shared<fizz::test::MockClock>());
     // Fizz is the name of the identity for our server certificate.
@@ -86,6 +89,7 @@ class ClientHandshakeTest : public Test, public boost::static_visitor<> {
                                 .setFizzClientContext(clientCtx)
                                 .setCertificateVerifier(verifier)
                                 .setPskCache(getPskCache())
+                                .setECHPolicy(getECHPolicy())
                                 .build();
     conn.reset(new QuicClientConnectionState(handshakeFactory));
     conn->readCodec = std::make_unique<QuicReadCodec>(QuicNodeType::Client);
@@ -120,6 +124,14 @@ class ClientHandshakeTest : public Test, public boost::static_visitor<> {
   }
 
   virtual std::shared_ptr<QuicPskCache> getPskCache() {
+    return nullptr;
+  }
+
+  virtual std::shared_ptr<fizz::ech::Decrypter> getECHDecrypter() {
+    return nullptr;
+  }
+
+  virtual std::shared_ptr<fizz::client::test::MockECHPolicy> getECHPolicy() {
     return nullptr;
   }
 
@@ -327,11 +339,25 @@ TEST_F(ClientHandshakeTest, TestRetryIntegrityVerification) {
   LongHeader header(
       LongHeader::Types::Retry, scid, dcid, 0, version, retryToken);
 
-  std::string integrityTag =
-      "\xd1\x69\x26\xd8\x1f\x6f\x9c\xa2\x95\x3a\x8a\xa4\x57\x5e\x1e\x49";
+  RetryPacket::IntegrityTagType integrityTag = {
+      0xd1,
+      0x69,
+      0x26,
+      0xd8,
+      0x1f,
+      0x6f,
+      0x9c,
+      0xa2,
+      0x95,
+      0x3a,
+      0x8a,
+      0xa4,
+      0x57,
+      0x5e,
+      0x1e,
+      0x49};
 
-  RetryPacket retryPacket(
-      std::move(header), folly::IOBuf::copyBuffer(integrityTag), initialByte);
+  RetryPacket retryPacket(std::move(header), integrityTag, initialByte);
 
   std::vector<uint8_t> odcidVec = {
       0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08};
@@ -379,10 +405,9 @@ TEST_F(ClientHandshakeTest, TestAppBytesInterpretedAsHandshake) {
 class ClientHandshakeCallbackTest : public ClientHandshakeTest {
  public:
   void setupClientAndServerContext() override {
-    clientCtx = std::make_shared<fizz::client::FizzClientContext>();
+    clientCtx = createClientCtx();
     clientCtx->setSupportedVersions({fizz::ProtocolVersion::tls_1_3});
     serverCtx->setSupportedVersions({fizz::ProtocolVersion::tls_1_3});
-    clientCtx->setClock(std::make_shared<fizz::test::MockClock>());
     setupZeroRttOnServerCtx(*serverCtx, psk_);
   }
 
@@ -428,15 +453,13 @@ class ClientHandshakeHRRTest : public ClientHandshakeTest {
   ~ClientHandshakeHRRTest() override = default;
 
   void setupClientAndServerContext() override {
-    clientCtx = std::make_shared<fizz::client::FizzClientContext>();
+    clientCtx = createClientCtx();
     clientCtx->setSupportedGroups(
         {fizz::NamedGroup::secp256r1, fizz::NamedGroup::x25519});
     clientCtx->setDefaultShares({fizz::NamedGroup::secp256r1});
-    clientCtx->setClock(std::make_shared<fizz::test::MockClock>());
-    serverCtx = std::make_shared<fizz::server::FizzServerContext>();
+    serverCtx = createServerCtx();
     serverCtx->setFactory(std::make_shared<QuicFizzFactory>());
     serverCtx->setSupportedGroups({fizz::NamedGroup::x25519});
-    serverCtx->setClock(std::make_shared<fizz::test::MockClock>());
     setupCtxWithTestCert(*serverCtx);
   }
 };
@@ -480,13 +503,11 @@ class ClientHandshakeZeroRttTest : public ClientHandshakeTest {
   ~ClientHandshakeZeroRttTest() override = default;
 
   void setupClientAndServerContext() override {
-    clientCtx = std::make_shared<fizz::client::FizzClientContext>();
+    clientCtx = createClientCtx();
     clientCtx->setSupportedVersions({fizz::ProtocolVersion::tls_1_3});
     clientCtx->setSupportedAlpns({"h3", "hq"});
-    clientCtx->setClock(std::make_shared<fizz::test::MockClock>());
     serverCtx->setSupportedVersions({fizz::ProtocolVersion::tls_1_3});
     serverCtx->setSupportedAlpns({"h3"});
-    serverCtx->setClock(std::make_shared<fizz::test::MockClock>());
     setupCtxWithTestCert(*serverCtx);
     psk = setupZeroRttOnClientCtx(*clientCtx, hostname);
     setupZeroRttServer();
@@ -583,5 +604,68 @@ TEST_F(ClientHandshakeZeroRttRejectFail, TestZeroRttRejectionParamsDontMatch) {
   expectZeroRttCipher(true, false);
   EXPECT_THROW(serverClientRound(), QuicInternalException);
 }
+
+class ClientHandshakeECHPolicyTest : public ClientHandshakeCallbackTest {
+ public:
+  void SetUp() override {
+    ClientHandshakeCallbackTest::SetUp();
+    auto handshakeBytes =
+        getHandshakeWriteBytes()->cloneCoalesced()->moveToFbString();
+    // Sanity Check: The original sni should not be encrypted when ECHPolicy is
+    // omitted from the FizzServerContext.
+    EXPECT_NE(handshakeBytes.find("Fizz"), handshakeBytes.size());
+  }
+
+  std::shared_ptr<fizz::ech::Decrypter> getECHDecrypter() override {
+    return echDecrypter;
+  }
+
+  std::shared_ptr<fizz::client::test::MockECHPolicy> getECHPolicy() override {
+    return echPolicy;
+  }
+
+  fizz::ech::ECHConfigContentDraft getECHConfigContent() {
+    fizz::ech::HpkeSymmetricCipherSuite suite{
+        fizz::hpke::KDFId::Sha256, fizz::hpke::AeadId::TLS_AES_128_GCM_SHA256};
+    fizz::ech::ECHConfigContentDraft echConfigContent;
+    echConfigContent.key_config.config_id = 0xFB;
+    echConfigContent.key_config.kem_id = fizz::hpke::KEMId::secp256r1;
+    echConfigContent.key_config.public_key = fizz::detail::encodeECPublicKey(
+        ::fizz::test::getPublicKey(::fizz::test::kP256PublicKey));
+    echConfigContent.key_config.cipher_suites = {suite};
+    echConfigContent.maximum_name_length = 100;
+    echConfigContent.public_name = folly::IOBuf::copyBuffer("public.dummy.com");
+    return echConfigContent;
+  }
+
+  fizz::ech::ECHConfig getECHConfig() {
+    fizz::ech::ECHConfig config;
+    config.version = fizz::ech::ECHVersion::Draft15;
+    config.ech_config_content = fizz::encode(getECHConfigContent());
+    return config;
+  }
+
+  std::shared_ptr<fizz::client::test::MockECHPolicy> echPolicy;
+  std::shared_ptr<fizz::ech::ECHConfigManager> echDecrypter;
+};
+
+TEST_F(ClientHandshakeECHPolicyTest, TestECHPolicyHandshake) {
+  echPolicy = std::make_shared<fizz::client::test::MockECHPolicy>();
+  EXPECT_CALL(*echPolicy, getConfig(_))
+      .WillOnce(Return(std::vector<fizz::ech::ECHConfig>{getECHConfig()}));
+
+  auto kex = std::make_unique<fizz::OpenSSLECKeyExchange<fizz::P256>>();
+  kex->setPrivateKey(fizz::test::getPrivateKey(fizz::test::kP256Key));
+  echDecrypter = std::make_shared<fizz::ech::ECHConfigManager>();
+  echDecrypter->addDecryptionConfig(
+      fizz::ech::DecrypterParams{getECHConfig(), kex->clone()});
+
+  // Try handshake flow with ECHPolicy set on FizzClientContext.
+  quic::test::ClientHandshakeECHPolicyTest::SetUp();
+  auto handshakeBytes =
+      getHandshakeWriteBytes()->cloneCoalesced()->moveToFbString();
+  EXPECT_NE(handshakeBytes.find("public.dummy.com"), handshakeBytes.size());
+}
+
 } // namespace test
 } // namespace quic

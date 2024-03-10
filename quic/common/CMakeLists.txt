@@ -30,7 +30,7 @@ target_link_libraries(
 add_library(
   mvfst_looper
   FunctionLooper.cpp
-  Timers.cpp
+  events/HighResQuicTimer.cpp
 )
 
 set_property(TARGET mvfst_looper PROPERTY VERSION ${PACKAGE_VERSION})
@@ -77,54 +77,6 @@ target_link_libraries(
 )
 
 add_library(
-  mvfst_events
-  QuicEventBase.cpp
-)
-
-set_property(TARGET mvfst_events PROPERTY VERSION ${PACKAGE_VERSION})
-
-target_include_directories(
-  mvfst_events PUBLIC
-  $<BUILD_INTERFACE:${QUIC_FBCODE_ROOT}>
-  $<INSTALL_INTERFACE:include/>
-)
-
-target_compile_options(
-  mvfst_events
-  PRIVATE
-  ${_QUIC_COMMON_COMPILE_OPTIONS}
-)
-
-target_link_libraries(
-  mvfst_events PUBLIC
-  Folly::folly
-)
-
-add_library(
-  mvfst_socketutil
-  SocketUtil.cpp
-)
-
-set_property(TARGET mvfst_socketutil PROPERTY VERSION ${PACKAGE_VERSION})
-
-target_include_directories(
-  mvfst_socketutil PUBLIC
-  $<BUILD_INTERFACE:${QUIC_FBCODE_ROOT}>
-  $<INSTALL_INTERFACE:include/>
-)
-
-target_compile_options(
-  mvfst_socketutil
-  PRIVATE
-  ${_QUIC_COMMON_COMPILE_OPTIONS}
-)
-
-target_link_libraries(
-  mvfst_socketutil PUBLIC
-  Folly::folly
-)
-
-add_library(
   mvfst_transport_knobs
   TransportKnobs.cpp
 )
@@ -147,31 +99,6 @@ target_link_libraries(
   mvfst_transport_knobs PUBLIC
   mvfst_constants
   Folly::folly
-)
-
-add_library(
-  mvfst_async_udp_socket_wrapper
-  QuicAsyncUDPSocketWrapper.cpp
-)
-
-set_property(TARGET mvfst_async_udp_socket_wrapper PROPERTY VERSION ${PACKAGE_VERSION})
-
-target_include_directories(
-  mvfst_async_udp_socket_wrapper PUBLIC
-  $<BUILD_INTERFACE:${QUIC_FBCODE_ROOT}>
-  $<INSTALL_INTERFACE:include/>
-)
-
-target_compile_options(
-  mvfst_async_udp_socket_wrapper
-  PRIVATE
-  ${_QUIC_COMMON_COMPILE_OPTIONS}
-)
-
-target_link_libraries(
-  mvfst_async_udp_socket_wrapper PUBLIC
-  Folly::folly
-  mvfst_events
 )
 
 file(
@@ -204,27 +131,11 @@ install(
 )
 
 install(
-  TARGETS mvfst_events
-  EXPORT mvfst-exports
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-install(
-  TARGETS mvfst_socketutil
-  EXPORT mvfst-exports
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-install(
   TARGETS mvfst_transport_knobs
   EXPORT mvfst-exports
   DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
-install(
-  TARGETS mvfst_async_udp_socket_wrapper
-  EXPORT mvfst-exports
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
+add_subdirectory(events)
+add_subdirectory(udpsocket)
 add_subdirectory(test)

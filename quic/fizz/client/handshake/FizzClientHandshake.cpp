@@ -52,6 +52,12 @@ FizzClientHandshake::connectImpl(folly::Optional<std::string> hostname) {
   context->setCompatibilityMode(false);
   // Since Draft-17, EOED should not be sent
   context->setOmitEarlyRecordLayer(true);
+
+  folly::Optional<std::vector<fizz::ech::ECHConfig>> echConfigs;
+  if (hostname.hasValue()) {
+    echConfigs = fizzContext_->getECHConfigs(*hostname);
+  }
+
   processActions(machine_.processConnect(
       state_,
       std::move(context),
@@ -59,7 +65,7 @@ FizzClientHandshake::connectImpl(folly::Optional<std::string> hostname) {
       std::move(hostname),
       std::move(cachedPsk),
       std::make_shared<FizzClientExtensions>(getClientTransportParameters()),
-      folly::none));
+      std::move(echConfigs)));
 
   return transportParams;
 }
@@ -123,13 +129,22 @@ bool FizzClientHandshake::verifyRetryIntegrityTag(
   auto expectedIntegrityTag = retryIntegrityTagGenerator.getRetryIntegrityTag(
       retryPacket.header.getVersion(), pseudoRetryPacket.get());
 
-  return folly::IOBufEqualTo()(
-      *expectedIntegrityTag, *retryPacket.integrityTag);
+  folly::IOBuf integrityTagWrapper = folly::IOBuf::wrapBufferAsValue(
+      retryPacket.integrityTag.data(), retryPacket.integrityTag.size());
+  return folly::IOBufEqualTo()(*expectedIntegrityTag, integrityTagWrapper);
 }
 
 bool FizzClientHandshake::isTLSResumed() const {
   auto pskType = state_.pskType();
   return pskType && *pskType == fizz::PskType::Resumption;
+}
+
+std::unique_ptr<std::vector<unsigned char>>
+FizzClientHandshake::getExportedKeyingMaterial(
+    const std::string& /* label */,
+    const std::vector<unsigned char>* /* context */,
+    uint16_t /* keyLength */) {
+  throw std::runtime_error("getExportedKeyingMaterial is not implemented");
 }
 
 EncryptionLevel FizzClientHandshake::getReadRecordLayerEncryptionLevel() {
@@ -146,8 +161,9 @@ bool FizzClientHandshake::matchEarlyParameters() {
   return fizz::client::earlyParametersMatch(state_);
 }
 
-std::pair<std::unique_ptr<Aead>, std::unique_ptr<PacketNumberCipher>>
-FizzClientHandshake::buildCiphers(CipherKind kind, folly::ByteRange secret) {
+std::unique_ptr<Aead> FizzClientHandshake::buildAead(
+    CipherKind kind,
+    folly::ByteRange secret) {
   bool isEarlyTraffic = kind == CipherKind::ZeroRttWrite;
   fizz::CipherSuite cipher =
       isEarlyTraffic ? state_.earlyDataParams()->cipher : *state_.cipher();
@@ -165,9 +181,19 @@ FizzClientHandshake::buildCiphers(CipherKind kind, folly::ByteRange secret) {
       kQuicKeyLabel,
       kQuicIVLabel));
 
-  auto packetNumberCipher = cryptoFactory_->makePacketNumberCipher(secret);
+  return aead;
+}
+std::unique_ptr<PacketNumberCipher> FizzClientHandshake::buildHeaderCipher(
+    folly::ByteRange secret) {
+  return cryptoFactory_->makePacketNumberCipher(secret);
+}
 
-  return {std::move(aead), std::move(packetNumberCipher)};
+Buf FizzClientHandshake::getNextTrafficSecret(folly::ByteRange secret) const {
+  auto deriver =
+      state_.context()->getFactory()->makeKeyDeriver(*state_.cipher());
+  auto nextSecret = deriver->expandLabel(
+      secret, kQuicKULabel, folly::IOBuf::create(0), secret.size());
+  return nextSecret;
 }
 
 void FizzClientHandshake::onNewCachedPsk(

@@ -13,6 +13,7 @@
 #include <quic/api/QuicSocket.h>
 #include <quic/client/QuicClientTransport.h>
 #include <quic/common/TimeUtil.h>
+#include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/fizz/client/handshake/QuicPskCache.h>
 #include <quic/logging/QLogger.h>
 
@@ -36,6 +37,12 @@ class QuicConnector : private quic::QuicSocket::ConnectionSetupCallback,
   };
 
   QuicConnector(Callback* cb);
+
+  ~QuicConnector() override {
+    // TODO we shouldn't need to do this but just as a safety measure
+    // to ensure we don't get a callback after detruction.
+    cancelTimerCallback();
+  }
 
   void connect(
       folly::EventBase* eventBase,
@@ -66,6 +73,7 @@ class QuicConnector : private quic::QuicSocket::ConnectionSetupCallback,
 
   // For testing.
   void connect(
+      std::shared_ptr<quic::FollyQuicEventBase> qEvb,
       std::shared_ptr<quic::QuicClientTransport> quicClient,
       std::chrono::milliseconds connectTimeout);
 
@@ -83,6 +91,7 @@ class QuicConnector : private quic::QuicSocket::ConnectionSetupCallback,
 
   Callback* cb_;
   TimePoint connectStart_;
+  std::shared_ptr<quic::FollyQuicEventBase> qEvb_;
   std::shared_ptr<quic::QuicClientTransport> quicClient_{nullptr};
 };
 

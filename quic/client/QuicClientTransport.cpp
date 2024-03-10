@@ -36,14 +36,14 @@ constexpr socklen_t kAddrLen = sizeof(sockaddr_storage);
 namespace quic {
 
 QuicClientTransport::QuicClientTransport(
-    QuicBackingEventBase* evb,
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+    std::shared_ptr<QuicEventBase> evb,
+    std::unique_ptr<QuicAsyncUDPSocket> socket,
     std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
     size_t connectionIdSize,
     PacketNum startingPacketNum,
     bool useConnectionEndWithErrorCallback)
     : QuicClientTransport(
-          evb,
+          std::move(evb),
           std::move(socket),
           std::move(handshakeFactory),
           connectionIdSize,
@@ -52,13 +52,13 @@ QuicClientTransport::QuicClientTransport(
 }
 
 QuicClientTransport::QuicClientTransport(
-    QuicBackingEventBase* evb,
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+    std::shared_ptr<QuicEventBase> evb,
+    std::unique_ptr<QuicAsyncUDPSocket> socket,
     std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
     size_t connectionIdSize,
     bool useConnectionEndWithErrorCallback)
     : QuicTransportBase(
-          evb,
+          std::move(evb),
           std::move(socket),
           useConnectionEndWithErrorCallback),
       happyEyeballsConnAttemptDelayTimeout_(this),
@@ -120,7 +120,7 @@ QuicClientTransport::~QuicClientTransport() {
 
 void QuicClientTransport::processUdpPacket(
     const folly::SocketAddress& peer,
-    ReceivedPacket&& udpPacket) {
+    ReceivedUdpPacket&& udpPacket) {
   // Process the arriving UDP packet, which may have coalesced QUIC packets.
   {
     BufQueue udpData;
@@ -180,7 +180,7 @@ void QuicClientTransport::processUdpPacket(
 
 void QuicClientTransport::processUdpPacketData(
     const folly::SocketAddress& peer,
-    const ReceivedPacket::Timings& udpPacketTimings,
+    const ReceivedUdpPacket::Timings& udpPacketTimings,
     BufQueue& udpPacketData) {
   auto packetSize = udpPacketData.chainLength();
   if (packetSize == 0) {
@@ -215,7 +215,8 @@ void QuicClientTransport::processUdpPacketData(
         !clientConn_->retryToken.empty();
 
     if (shouldRejectRetryPacket) {
-      VLOG(4) << "Server incorrectly issued a retry packet; dropping retry";
+      VLOG(4) << "Server incorrectly issued a retry packet; dropping retry "
+              << *this;
       return;
     }
 
@@ -225,7 +226,7 @@ void QuicClientTransport::processUdpPacketData(
     if (!clientConn_->clientHandshakeLayer->verifyRetryIntegrityTag(
             *originalDstConnId, *retryPacket)) {
       VLOG(4) << "The integrity tag in the retry packet was invalid. "
-              << "Dropping bad retry packet.";
+              << "Dropping bad retry packet. " << *this;
       return;
     }
 
@@ -268,7 +269,8 @@ void QuicClientTransport::processUdpPacketData(
         ? clientConn_->pendingOneRttData
         : clientConn_->pendingHandshakeData;
     pendingData.emplace_back(
-        ReceivedPacket(std::move(cipherUnavailable->packet), udpPacketTimings),
+        ReceivedUdpPacket(
+            std::move(cipherUnavailable->packet), udpPacketTimings),
         peer);
     if (conn_->qLogger) {
       conn_->qLogger->addPacketBuffered(
@@ -279,6 +281,7 @@ void QuicClientTransport::processUdpPacketData(
 
   RegularQuicPacket* regularOptional = parsedPacket.regularPacket();
   if (!regularOptional) {
+    VLOG(4) << "Packet parse error for " << *this;
     QUIC_STATS(
         statsCallback_, onPacketDropped, PacketDropReason::PARSE_ERROR_CLIENT);
     if (conn_->qLogger) {
@@ -291,6 +294,7 @@ void QuicClientTransport::processUdpPacketData(
     // This is either a packet that has no data (long-header parsed but no data
     // found) or a regular packet with a short header and no frames. Both are
     // protocol violations.
+    LOG(ERROR) << "Packet has no frames " << *this;
     QUIC_STATS(
         conn_->statsCallback,
         onPacketDropped,
@@ -367,9 +371,11 @@ void QuicClientTransport::processUdpPacketData(
     throw QuicTransportException(
         "Invalid connection id", TransportErrorCode::PROTOCOL_VIOLATION);
   }
+
+  // Add the packet to the AckState associated with the packet number space.
   auto& ackState = getAckState(*conn_, pnSpace);
-  uint64_t distanceFromExpectedPacketNum = updateLargestReceivedPacketNum(
-      *conn_, ackState, packetNum, udpPacketTimings.receiveTimePoint);
+  uint64_t distanceFromExpectedPacketNum =
+      addPacketToAckState(*conn_, ackState, packetNum, udpPacketTimings);
   if (distanceFromExpectedPacketNum > 0) {
     QUIC_STATS(conn_->statsCallback, onOutOfOrderPacketReceived);
   }
@@ -401,6 +407,8 @@ void QuicClientTransport::processUdpPacketData(
                 // processing loop.
                 conn_->handshakeLayer->handshakeConfirmed();
               }
+              maybeVerifyPendingKeyUpdate(
+                  *conn_, outstandingPacket, regularPacket);
               switch (packetFrame.type()) {
                 case QuicWriteFrame::Type::WriteAckFrame: {
                   const WriteAckFrame& frame = *packetFrame.asWriteAckFrame();
@@ -646,6 +654,8 @@ void QuicClientTransport::processUdpPacketData(
     handshakeConfirmed(*conn_);
   }
 
+  maybeHandleIncomingKeyUpdate(*conn_);
+
   // Try reading bytes off of crypto, and performing a handshake.
   auto cryptoData = readDataFromCryptoStream(
       *getCryptoStream(*conn_->cryptoState, encryptionLevel));
@@ -772,6 +782,9 @@ void QuicClientTransport::processUdpPacketData(
       if (clientConn_->statelessResetToken) {
         conn_->readCodec->setStatelessResetToken(
             clientConn_->statelessResetToken.value());
+        auto& cryptoFactory = handshakeLayer->getCryptoFactory();
+        conn_->readCodec->setCryptoEqual(
+            cryptoFactory.getCryptoEqualFunction());
       }
     }
 
@@ -802,7 +815,7 @@ void QuicClientTransport::processUdpPacketData(
 
 void QuicClientTransport::onReadData(
     const folly::SocketAddress& peer,
-    ReceivedPacket&& udpPacket) {
+    ReceivedUdpPacket&& udpPacket) {
   if (closeState_ == CloseState::CLOSED) {
     // If we are closed, then we shouldn't process new network data.
     QUIC_STATS(
@@ -812,15 +825,18 @@ void QuicClientTransport::onReadData(
     }
     return;
   }
-  bool waitingForFirstPacket = !hasReceivedPackets(*conn_);
+  bool waitingForFirstPacket = !hasReceivedUdpPackets(*conn_);
   processUdpPacket(peer, std::move(udpPacket));
   if (connSetupCallback_ && waitingForFirstPacket &&
-      hasReceivedPackets(*conn_)) {
+      hasReceivedUdpPackets(*conn_)) {
     connSetupCallback_->onFirstPeerPacketProcessed();
   }
   if (!transportReadyNotified_ && hasWriteCipher()) {
     transportReadyNotified_ = true;
     connSetupCallback_->onTransportReady();
+
+    // This is a new connection. Update QUIC Stats
+    QUIC_STATS(statsCallback_, onNewConnection);
   }
 
   // Checking connSetupCallback_ because application will start to write data
@@ -902,6 +918,7 @@ void QuicClientTransport::writeData() {
   // use.
   SCOPE_EXIT {
     conn_->pendingEvents.numProbePackets = {};
+    maybeInitiateKeyUpdate(*conn_);
   };
   if (conn_->initialWriteCipher) {
     auto& initialCryptoStream =
@@ -1013,7 +1030,7 @@ void QuicClientTransport::startCryptoHandshake() {
   conn_->initialHeaderCipher = cryptoFactory.makeClientInitialHeaderCipher(
       *clientConn_->initialDestinationConnectionId, version);
 
-  setSupportedExtensionTransportParameters();
+  customTransportParameters_ = getSupportedExtTransportParams(*conn_);
 
   auto paramsExtension = std::make_shared<ClientTransportParametersExtension>(
       conn_->originalVersion.value(),
@@ -1065,7 +1082,7 @@ bool QuicClientTransport::isTLSResumed() const {
 }
 
 void QuicClientTransport::errMessage(
-    FOLLY_MAYBE_UNUSED const cmsghdr& cmsg) noexcept {
+    [[maybe_unused]] const cmsghdr& cmsg) noexcept {
 #ifdef FOLLY_HAVE_MSG_ERRQUEUE
   if ((cmsg.cmsg_level == SOL_IP && cmsg.cmsg_type == IP_RECVERR) ||
       (cmsg.cmsg_level == SOL_IPV6 && cmsg.cmsg_type == IPV6_RECVERR)) {
@@ -1080,9 +1097,9 @@ void QuicClientTransport::errMessage(
         happyEyeballsState.shouldWriteToFirstSocket = false;
         socket_->pauseRead();
         if (happyEyeballsState.connAttemptDelayTimeout &&
-            happyEyeballsState.connAttemptDelayTimeout->isScheduled()) {
+            isTimeoutScheduled(happyEyeballsState.connAttemptDelayTimeout)) {
           happyEyeballsState.connAttemptDelayTimeout->timeoutExpired();
-          happyEyeballsState.connAttemptDelayTimeout->cancelTimeout();
+          cancelTimeout(happyEyeballsState.connAttemptDelayTimeout);
         }
       } else if (
           cmsg.cmsg_level == SOL_IP &&
@@ -1142,7 +1159,7 @@ bool QuicClientTransport::shouldOnlyNotify() {
 }
 
 void QuicClientTransport::recvMsg(
-    QuicAsyncUDPSocketType& sock,
+    QuicAsyncUDPSocket& sock,
     uint64_t readBufferSize,
     int numPackets,
     NetworkData& networkData,
@@ -1165,7 +1182,7 @@ void QuicClientTransport::recvMsg(
     }
 
     int flags = 0;
-    QuicAsyncUDPSocketWrapper::ReadCallback::OnDataAvailableParams params;
+    QuicAsyncUDPSocket::ReadCallback::OnDataAvailableParams params;
     struct msghdr msg {};
     msg.msg_name = rawAddr;
     msg.msg_namelen = rawAddr ? kAddrLen : 0;
@@ -1174,8 +1191,9 @@ void QuicClientTransport::recvMsg(
 #ifdef FOLLY_HAVE_MSG_ERRQUEUE
     bool useGRO = sock.getGRO() > 0;
     bool useTS = sock.getTimestamping() > 0;
-    char control[QuicAsyncUDPSocketWrapper::ReadCallback::
-                     OnDataAvailableParams::kCmsgSpace] = {};
+    char control
+        [QuicAsyncUDPSocket::ReadCallback::OnDataAvailableParams::kCmsgSpace] =
+            {};
 
     if (useGRO || useTS) {
       msg.msg_control = control;
@@ -1210,7 +1228,7 @@ void QuicClientTransport::recvMsg(
     }
 #ifdef FOLLY_HAVE_MSG_ERRQUEUE
     if (useGRO) {
-      QuicAsyncUDPSocketWrapper::fromMsg(params, msg);
+      QuicAsyncUDPSocket::fromMsg(params, msg);
 
       // truncated
       if ((size_t)ret > readBufferSize) {
@@ -1248,25 +1266,25 @@ void QuicClientTransport::recvMsg(
 
           offset += params.gro;
           remaining -= params.gro;
-          networkData.addPacket(ReceivedPacket(std::move(tmp)));
+          networkData.addPacket(ReceivedUdpPacket(std::move(tmp)));
         } else {
           // do not clone the last packet
           // start at offset, use all the remaining data
           readBuffer->trimStart(offset);
           DCHECK_EQ(readBuffer->length(), remaining);
           remaining = 0;
-          networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
+          networkData.addPacket(ReceivedUdpPacket(std::move(readBuffer)));
         }
       }
     } else {
-      networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
+      networkData.addPacket(ReceivedUdpPacket(std::move(readBuffer)));
     }
     trackDatagramReceived(bytesRead);
   }
 }
 
 void QuicClientTransport::recvMmsg(
-    QuicAsyncUDPSocketType& sock,
+    QuicAsyncUDPSocket& sock,
     uint64_t readBufferSize,
     uint16_t numPackets,
     NetworkData& networkData,
@@ -1279,8 +1297,7 @@ void QuicClientTransport::recvMmsg(
   bool useTS = sock.getTimestamping() > 0;
   std::vector<std::array<
       char,
-      QuicAsyncUDPSocketWrapper::ReadCallback::OnDataAvailableParams::
-          kCmsgSpace>>
+      QuicAsyncUDPSocket::ReadCallback::OnDataAvailableParams::kCmsgSpace>>
       controlVec((useGRO || useTS) ? numPackets : 0);
 
   // we need to consider MSG_TRUNC too
@@ -1349,10 +1366,10 @@ void QuicClientTransport::recvMmsg(
       // should ignore such datagrams.
       continue;
     }
-    QuicAsyncUDPSocketWrapper::ReadCallback::OnDataAvailableParams params;
+    QuicAsyncUDPSocket::ReadCallback::OnDataAvailableParams params;
 #ifdef FOLLY_HAVE_MSG_ERRQUEUE
     if (useGRO || useTS) {
-      QuicAsyncUDPSocketWrapper::fromMsg(params, msg.msg_hdr);
+      QuicAsyncUDPSocket::fromMsg(params, msg.msg_hdr);
 
       // truncated
       if (bytesRead > readBufferSize) {
@@ -1392,18 +1409,18 @@ void QuicClientTransport::recvMmsg(
 
           offset += params.gro;
           remaining -= params.gro;
-          networkData.addPacket(ReceivedPacket(std::move(tmp)));
+          networkData.addPacket(ReceivedUdpPacket(std::move(tmp)));
         } else {
           // do not clone the last packet
           // start at offset, use all the remaining data
           readBuffer->trimStart(offset);
           DCHECK_EQ(readBuffer->length(), remaining);
           remaining = 0;
-          networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
+          networkData.addPacket(ReceivedUdpPacket(std::move(readBuffer)));
         }
       }
     } else {
-      networkData.addPacket(ReceivedPacket(std::move(readBuffer)));
+      networkData.addPacket(ReceivedUdpPacket(std::move(readBuffer)));
     }
 
     trackDatagramReceived(bytesRead);
@@ -1411,7 +1428,8 @@ void QuicClientTransport::recvMmsg(
 }
 
 void QuicClientTransport::onNotifyDataAvailable(
-    QuicAsyncUDPSocketWrapper& sock) noexcept {
+    QuicAsyncUDPSocket& sock) noexcept {
+  auto self = this->shared_from_this();
   CHECK(conn_) << "trying to receive packets without a connection";
   auto readBufferSize =
       conn_->transportSettings.maxRecvPacketSize * numGROBuffers_;
@@ -1423,7 +1441,7 @@ void QuicClientTransport::onNotifyDataAvailable(
   folly::Optional<folly::SocketAddress> server;
 
   if (conn_->transportSettings.shouldUseWrapperRecvmmsgForBatchRecv) {
-    const auto result = sock.recvMmsg(
+    const auto result = sock.recvmmsgNetworkData(
         readBufferSize, numPackets, networkData, server, totalData);
 
     // track the received packets
@@ -1513,7 +1531,7 @@ void QuicClientTransport::start(
     // TODO Supply v4 delay amount from somewhere when we want to tune this
     startHappyEyeballs(
         *clientConn_,
-        qEvbPtr_,
+        evb_.get(),
         happyEyeballsCachedFamily_,
         happyEyeballsConnAttemptDelayTimeout_,
         happyEyeballsCachedFamily_ == AF_UNSPEC
@@ -1604,7 +1622,7 @@ void QuicClientTransport::setHappyEyeballsCachedFamily(
 }
 
 void QuicClientTransport::addNewSocket(
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> socket) {
+    std::unique_ptr<QuicAsyncUDPSocket> socket) {
   happyEyeballsAddSocket(*clientConn_, std::move(socket));
 }
 
@@ -1614,48 +1632,6 @@ void QuicClientTransport::setHostname(const std::string& hostname) {
 
 void QuicClientTransport::setSelfOwning() {
   selfOwning_ = shared_from_this();
-}
-
-void QuicClientTransport::setSupportedExtensionTransportParameters() {
-  const auto& ts = conn_->transportSettings;
-  using TpId = TransportParameterId;
-  customTransportParameters_.clear();
-
-  if (ts.minAckDelay.hasValue()) {
-    customTransportParameters_.push_back(encodeIntegerParameter(
-        TpId::min_ack_delay, ts.minAckDelay.value().count()));
-  }
-
-  if (ts.datagramConfig.enabled) {
-    customTransportParameters_.push_back(encodeIntegerParameter(
-        TpId::max_datagram_frame_size, conn_->datagramState.maxReadFrameSize));
-  }
-
-  customTransportParameters_.push_back(encodeIntegerParameter(
-      TpId::ack_receive_timestamps_enabled,
-      ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value() ? 1 : 0));
-
-  if (ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value()) {
-    customTransportParameters_.push_back(encodeIntegerParameter(
-        TpId::max_receive_timestamps_per_ack,
-        ts.maybeAckReceiveTimestampsConfigSentToPeer.value()
-            .maxReceiveTimestampsPerAck));
-
-    customTransportParameters_.push_back(encodeIntegerParameter(
-        TpId::receive_timestamps_exponent,
-        ts.maybeAckReceiveTimestampsConfigSentToPeer.value()
-            .receiveTimestampsExponent));
-  }
-
-  if (ts.advertisedKnobFrameSupport) {
-    customTransportParameters_.push_back(
-        encodeIntegerParameter(TpId::knob_frames_supported, 1));
-  }
-
-  if (ts.advertisedMaxStreamGroups > 0) {
-    customTransportParameters_.push_back(encodeIntegerParameter(
-        TpId::stream_groups_enabled, ts.advertisedMaxStreamGroups));
-  }
 }
 
 void QuicClientTransport::adjustGROBuffers() {
@@ -1675,7 +1651,7 @@ void QuicClientTransport::adjustGROBuffers() {
 }
 
 void QuicClientTransport::closeTransport() {
-  happyEyeballsConnAttemptDelayTimeout_.cancelTimeout();
+  cancelTimeout(&happyEyeballsConnAttemptDelayTimeout_);
 }
 
 void QuicClientTransport::unbindConnection() {
@@ -1692,7 +1668,7 @@ void QuicClientTransport::setSupportedVersions(
 }
 
 void QuicClientTransport::onNetworkSwitch(
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> newSock) {
+    std::unique_ptr<QuicAsyncUDPSocket> newSock) {
   if (!conn_->oneRttWriteCipher) {
     return;
   }
@@ -1729,6 +1705,7 @@ void QuicClientTransport::setTransportStatsCallback(
   statsCallback_ = std::move(statsCallback);
   if (statsCallback_) {
     conn_->statsCallback = statsCallback_.get();
+    conn_->readCodec->setConnectionStatsCallback(statsCallback_.get());
   } else {
     conn_->statsCallback = nullptr;
   }

@@ -9,11 +9,11 @@
 #include <folly/chrono/Conv.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/SocketOptionMap.h>
+#include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/system/ThreadId.h>
 #include <quic/QuicConstants.h>
-#include <quic/common/SocketUtil.h>
-#include <quic/common/Timers.h>
 #include <atomic>
+#include <memory>
 
 #ifdef FOLLY_HAVE_MSG_ERRQUEUE
 #include <linux/net_tstamp.h>
@@ -22,6 +22,7 @@
 #endif
 
 #include <folly/Conv.h>
+#include <quic/common/SocketUtil.h>
 #include <quic/congestion_control/Bbr.h>
 #include <quic/congestion_control/Copa.h>
 #include <quic/fizz/handshake/FizzRetryIntegrityTagGenerator.h>
@@ -49,6 +50,9 @@ bool isValidConnIdLength(const quic::ConnectionId& connId) {
 namespace quic {
 
 std::atomic_int globalUnfinishedHandshakes{0};
+int QuicServerWorker::getUnfinishedHandshakeCount() {
+  return globalUnfinishedHandshakes.load(std::memory_order_relaxed);
+}
 
 QuicServerWorker::QuicServerWorker(
     std::shared_ptr<QuicServerWorker::WorkerCallback> callback,
@@ -66,14 +70,14 @@ folly::EventBase* QuicServerWorker::getEventBase() const {
 }
 
 void QuicServerWorker::setSocket(
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> socket) {
+    std::unique_ptr<FollyAsyncUDPSocketAlias> socket) {
   socket_ = std::move(socket);
   evb_ = folly::Executor::KeepAlive(socket_->getEventBase());
 }
 
 void QuicServerWorker::bind(
     const folly::SocketAddress& address,
-    QuicAsyncUDPSocketWrapper::BindOptions bindOptions) {
+    FollyAsyncUDPSocketAlias::BindOptions bindOptions) {
   DCHECK(!supportedVersions_.empty());
   CHECK(socket_);
   switch (setEventCallback_) {
@@ -90,7 +94,7 @@ void QuicServerWorker::bind(
   // bind, since bind creates the fd.
   if (socketOptions_) {
     applySocketOptions(
-        *socket_,
+        *socket_.get(),
         *socketOptions_,
         address.getFamily(),
         folly::SocketOptionKey::ApplyPos::PRE_BIND);
@@ -98,7 +102,7 @@ void QuicServerWorker::bind(
   socket_->bind(address, bindOptions);
   if (socketOptions_) {
     applySocketOptions(
-        *socket_,
+        *socket_.get(),
         *socketOptions_,
         address.getFamily(),
         folly::SocketOptionKey::ApplyPos::POST_BIND);
@@ -115,7 +119,7 @@ void QuicServerWorker::bind(
   socket_->setTXTime({CLOCK_MONOTONIC, /*deadline=*/false});
 
   if (mvfst_hook_on_socket_create) {
-    mvfst_hook_on_socket_create(getSocketFd(*socket_));
+    mvfst_hook_on_socket_create(socket_->getNetworkSocket().toFd());
   }
 }
 
@@ -176,7 +180,7 @@ void QuicServerWorker::setUnfinishedHandshakeLimit(
 void QuicServerWorker::start() {
   CHECK(socket_);
   if (!pacingTimer_) {
-    pacingTimer_ = TimerHighRes::newTimer(
+    pacingTimer_ = std::make_unique<HighResQuicTimer>(
         evb_.get(), transportSettings_.pacingTimerResolution);
   }
   socket_->resumeRead(this);
@@ -207,7 +211,7 @@ void QuicServerWorker::pauseRead() {
 
 int QuicServerWorker::getFD() {
   CHECK(socket_);
-  return getSocketFd(*socket_);
+  return socket_->getNetworkSocket().toFd();
 }
 
 const folly::SocketAddress& QuicServerWorker::getAddress() const {
@@ -505,7 +509,7 @@ void QuicServerWorker::recvmsgMultishotCallback(
       struct msghdr msg;
       msg.msg_controllen = p.control.size();
       msg.msg_control = (void*)p.control.data();
-      QuicAsyncUDPSocketWrapper::fromMsg(params, msg);
+      FollyAsyncUDPSocketAlias::fromMsg(params, msg);
     }
 #endif
     bool truncated = false;
@@ -531,7 +535,7 @@ void QuicServerWorker::eventRecvmsgCallback(MsgHdr* msgHdr, int bytesRead) {
     OnDataAvailableParams params;
 #ifdef FOLLY_HAVE_MSG_ERRQUEUE
     if (msg.msg_control) {
-      QuicAsyncUDPSocketWrapper::fromMsg(params, msg);
+      FollyAsyncUDPSocketAlias::fromMsg(params, msg);
     }
 #endif
     bool truncated = false;
@@ -610,11 +614,12 @@ void QuicServerWorker::forwardNetworkData(
       std::move(routingData),
       std::move(networkData),
       std::move(quicVersion),
+      getEventBase(),
       isForwardedData);
 }
 
 void QuicServerWorker::setPacingTimer(
-    TimerHighRes::SharedPtr pacingTimer) noexcept {
+    QuicTimer::SharedPtr pacingTimer) noexcept {
   pacingTimer_ = std::move(pacingTimer);
 }
 
@@ -836,7 +841,7 @@ void QuicServerWorker::dispatchPacketData(
   // route with destinationConnId chosen by the peer and IP address of the
   // peer.
   CHECK(routingData.headerForm == HeaderForm::Long);
-  auto sit = sourceAddressMap_.find({client, dstConnId});
+  auto sit = sourceAddressMap_.find(std::make_pair(client, dstConnId));
   if (sit != sourceAddressMap_.end()) {
     VLOG(4) << "Found existing connection for client=" << client << " "
             << sit->second.get();
@@ -1082,8 +1087,12 @@ void QuicServerWorker::sendRetryPacket(
       folly::IOBuf::copyBuffer(encryptedTokenStr));
   Buf pseudoRetryPacketBuf = std::move(pseudoBuilder).buildPacket();
   FizzRetryIntegrityTagGenerator fizzRetryIntegrityTagGenerator;
-  auto integrityTag = fizzRetryIntegrityTagGenerator.getRetryIntegrityTag(
+  auto integrityTagBuf = fizzRetryIntegrityTagGenerator.getRetryIntegrityTag(
       QuicVersion::MVFST_INVALID, pseudoRetryPacketBuf.get());
+  folly::io::Cursor cursor{integrityTagBuf.get()};
+
+  RetryPacket::IntegrityTagType integrityTag = {0};
+  cursor.pull(integrityTag.data(), integrityTag.size());
 
   // Create the actual retry packet
   RetryPacketBuilder builder(
@@ -1091,7 +1100,7 @@ void QuicServerWorker::sendRetryPacket(
       srcConnId, /* dst conn id */
       QuicVersion::MVFST_INVALID,
       std::move(encryptedTokenStr),
-      std::move(integrityTag));
+      integrityTag);
 
   auto retryData = std::move(builder).buildPacket();
   auto retryDataLen = retryData->computeChainDataLength();
@@ -1102,7 +1111,7 @@ void QuicServerWorker::sendRetryPacket(
 }
 
 void QuicServerWorker::allowBeingTakenOver(
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+    std::unique_ptr<FollyAsyncUDPSocketAlias> socket,
     const folly::SocketAddress& address) {
   DCHECK(!takeoverCB_);
   // We instantiate and bind the TakeoverHandlerCallback to the given address.
@@ -1113,7 +1122,7 @@ void QuicServerWorker::allowBeingTakenOver(
 }
 
 const folly::SocketAddress& QuicServerWorker::overrideTakeoverHandlerAddress(
-    std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+    std::unique_ptr<FollyAsyncUDPSocketAlias> socket,
     const folly::SocketAddress& address) {
   CHECK(takeoverCB_);
   takeoverCB_->rebind(std::move(socket), address);
@@ -1235,22 +1244,22 @@ void QuicServerWorker::setHealthCheckToken(
   healthCheckToken_ = folly::IOBuf::copyBuffer(healthCheckToken);
 }
 
-std::unique_ptr<QuicAsyncUDPSocketWrapper> QuicServerWorker::makeSocket(
+std::unique_ptr<FollyAsyncUDPSocketAlias> QuicServerWorker::makeSocket(
     folly::EventBase* evb) const {
   CHECK(socket_);
-  auto sock = socketFactory_->make(evb, getSocketFd(*socket_));
+  auto sock = socketFactory_->make(evb, socket_->getNetworkSocket().toFd());
   if (sock && mvfst_hook_on_socket_create) {
-    mvfst_hook_on_socket_create(getSocketFd(*sock));
+    mvfst_hook_on_socket_create(sock->getNetworkSocket().toFd());
   }
   return sock;
 }
 
-std::unique_ptr<QuicAsyncUDPSocketWrapper> QuicServerWorker::makeSocket(
+std::unique_ptr<FollyAsyncUDPSocketAlias> QuicServerWorker::makeSocket(
     folly::EventBase* evb,
     int fd) const {
   auto sock = socketFactory_->make(evb, fd);
   if (sock && mvfst_hook_on_socket_create) {
-    mvfst_hook_on_socket_create(getSocketFd(*sock));
+    mvfst_hook_on_socket_create(sock->getNetworkSocket().toFd());
   }
   return sock;
 }
@@ -1287,7 +1296,6 @@ void QuicServerWorker::onConnectionIdAvailable(
       // If we aren't currently running, start the timer.
       evb_->timer().scheduleTimeout(this, timeLoggingSamplingInterval_);
     }
-    QUIC_STATS(statsCallback_, onNewConnection);
   }
 }
 

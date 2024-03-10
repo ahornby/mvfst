@@ -15,7 +15,7 @@
 #include <quic/client/state/ClientStateMachine.h>
 #include <quic/common/BufAccessor.h>
 #include <quic/common/BufUtil.h>
-#include <quic/common/QuicAsyncUDPSocketWrapper.h>
+#include <quic/common/udpsocket/QuicAsyncUDPSocket.h>
 #include <quic/state/QuicConnectionStats.h>
 
 namespace quic {
@@ -24,21 +24,21 @@ class ClientHandshakeFactory;
 
 class QuicClientTransport
     : public QuicTransportBase,
-      public QuicAsyncUDPSocketWrapper::ReadCallback,
-      public QuicAsyncUDPSocketWrapper::ErrMessageCallback,
+      public QuicAsyncUDPSocket::ReadCallback,
+      public QuicAsyncUDPSocket::ErrMessageCallback,
       public std::enable_shared_from_this<QuicClientTransport> {
  public:
   QuicClientTransport(
-      QuicBackingEventBase* evb,
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+      std::shared_ptr<QuicEventBase> evb,
+      std::unique_ptr<QuicAsyncUDPSocket> socket,
       std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
       size_t connectionIdSize = 0,
       bool useConnectionEndWithErrorCallback = false);
 
   // Testing only API:
   QuicClientTransport(
-      QuicBackingEventBase* evb,
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+      std::shared_ptr<QuicEventBase> evb,
+      std::unique_ptr<QuicAsyncUDPSocket> socket,
       std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
       size_t connectionIdSize,
       PacketNum startingPacketNum,
@@ -58,8 +58,8 @@ class QuicClientTransport
    */
   template <class TransportType = QuicClientTransport>
   static std::shared_ptr<TransportType> newClient(
-      folly::EventBase* evb,
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> sock,
+      std::shared_ptr<QuicEventBase> evb,
+      std::unique_ptr<QuicAsyncUDPSocket> sock,
       std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
       size_t connectionIdSize = 0,
       bool useConnectionEndWithErrorCallback = false) {
@@ -89,7 +89,7 @@ class QuicClientTransport
    * optional. If not called, INADDR_ANY will be used.
    */
   void setLocalAddress(folly::SocketAddress localAddress);
-  void addNewSocket(std::unique_ptr<QuicAsyncUDPSocketWrapper> socket);
+  void addNewSocket(std::unique_ptr<QuicAsyncUDPSocket> socket);
   void setHappyEyeballsEnabled(bool happyEyeballsEnabled);
   virtual void setHappyEyeballsCachedFamily(sa_family_t cachedFamily);
 
@@ -103,7 +103,21 @@ class QuicClientTransport
   /**
    * Returns whether or not TLS is resumed.
    */
-  bool isTLSResumed() const;
+  virtual bool isTLSResumed() const;
+
+  /*
+   * Export the underlying TLS key material.
+   * label is the label argument for the TLS exporter.
+   * context is the context value argument for the TLS exporter.
+   * keyLength is the length of the exported key.
+   */
+  virtual std::unique_ptr<std::vector<unsigned char>> getExportedKeyingMaterial(
+      const std::string& label,
+      const std::vector<unsigned char>* context,
+      uint16_t keyLength) {
+    return clientConn_->clientHandshakeLayer->getExportedKeyingMaterial(
+        label, context, keyLength);
+  }
 
   enum class ZeroRttAttemptState : uint8_t {
     NotAttempted = 0,
@@ -113,7 +127,7 @@ class QuicClientTransport
   /**
    * Returns the state of the 0RTT attempt if there was one.
    */
-  ZeroRttAttemptState getZeroRttState() {
+  virtual ZeroRttAttemptState getZeroRttState() {
     if (!clientConn_->zeroRttRejected.has_value()) {
       return ZeroRttAttemptState::NotAttempted;
     }
@@ -122,19 +136,20 @@ class QuicClientTransport
   }
 
   // From QuicTransportBase
-  void onReadData(const folly::SocketAddress& peer, ReceivedPacket&& udpPacket)
-      override;
+  void onReadData(
+      const folly::SocketAddress& peer,
+      ReceivedUdpPacket&& udpPacket) override;
   void writeData() override;
   void closeTransport() override;
   void unbindConnection() override;
   bool hasWriteCipher() const override;
   std::shared_ptr<QuicTransportBase> sharedGuard() override;
 
-  // QuicAsyncUDPSocketWrapper::ReadCallback
+  // QuicAsyncUDPSocket::ReadCallback
   void onReadClosed() noexcept override {}
   void onReadError(const folly::AsyncSocketException&) noexcept override;
 
-  // QuicAsyncUDPSocketWrapper::ErrMessageCallback
+  // QuicAsyncUDPSocket::ErrMessageCallback
   void errMessage(const cmsghdr& cmsg) noexcept override;
   void errMessageError(const folly::AsyncSocketException&) noexcept override {}
 
@@ -154,8 +169,7 @@ class QuicClientTransport
    */
   void setSelfOwning();
 
-  void onNetworkSwitch(
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> newSock) override;
+  void onNetworkSwitch(std::unique_ptr<QuicAsyncUDPSocket> newSock) override;
 
   /**
    * Set callback for various transport stats (such as packet received, dropped
@@ -209,7 +223,7 @@ class QuicClientTransport
     return wrappedObserverContainer_.getPtr();
   }
 
-  // From QuicAsyncUDPSocketWrapper::ReadCallback
+  // From QuicAsyncUDPSocket::ReadCallback
   void getReadBuffer(void** buf, size_t* len) noexcept override;
   void onDataAvailable(
       const folly::SocketAddress& server,
@@ -217,17 +231,17 @@ class QuicClientTransport
       bool truncated,
       OnDataAvailableParams params) noexcept override;
   bool shouldOnlyNotify() override;
-  void onNotifyDataAvailable(QuicAsyncUDPSocketWrapper& sock) noexcept override;
+  void onNotifyDataAvailable(QuicAsyncUDPSocket& sock) noexcept override;
 
   void recvMsg(
-      QuicAsyncUDPSocketType& sock,
+      QuicAsyncUDPSocket& sock,
       uint64_t readBufferSize,
       int numPackets,
       NetworkData& networkData,
       folly::Optional<folly::SocketAddress>& server,
       size_t& totalData);
   void recvMmsg(
-      QuicAsyncUDPSocketType& sock,
+      QuicAsyncUDPSocket& sock,
       uint64_t readBufferSize,
       uint16_t numPackets,
       NetworkData& networkData,
@@ -246,7 +260,7 @@ class QuicClientTransport
    */
   void processUdpPacket(
       const folly::SocketAddress& peer,
-      ReceivedPacket&& udpPacket);
+      ReceivedUdpPacket&& udpPacket);
 
   /**
    * Process data within a single UDP packet.
@@ -268,7 +282,7 @@ class QuicClientTransport
    */
   void processUdpPacketData(
       const folly::SocketAddress& peer,
-      const ReceivedPacket::Timings& udpPacketTimings,
+      const ReceivedUdpPacket::Timings& udpPacketTimings,
       BufQueue& udpPacketData);
 
   void startCryptoHandshake();
@@ -299,7 +313,6 @@ class QuicClientTransport
     void resize(size_t numPackets);
   };
 
-  void setSupportedExtensionTransportParameters();
   void adjustGROBuffers();
   void trackDatagramReceived(size_t len);
 

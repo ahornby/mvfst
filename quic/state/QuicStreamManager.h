@@ -25,9 +25,64 @@ constexpr uint64_t kMaxStreamGroupId = 128 * kStreamGroupIncrement;
 
 } // namespace detail
 
+/*
+ * Class for containing a set of stream IDs, which wraps a IntervalSet.
+ * This saves space when the set contains "contiguous" stream IDs for a given
+ * type. For example, 0, 4, 8, ... 400 is internally represented by a single
+ * entry, [0, 400].
+ */
+class StreamIdSet {
+ public:
+  explicit StreamIdSet(StreamId base) : base_(static_cast<uint8_t>(base)) {}
+  StreamIdSet() : base_(0) {}
+
+  void add(StreamId id) {
+    add(id, id);
+  }
+
+  void remove(StreamId id) {
+    id -= base_;
+    CHECK_EQ(id % detail::kStreamIncrement, 0);
+    id /= detail::kStreamIncrement;
+    streams_.withdraw(Interval<StreamId>(id, id));
+  }
+
+  void add(StreamId first, StreamId last) {
+    first -= base_;
+    last -= base_;
+    CHECK_EQ(first % detail::kStreamIncrement, 0);
+    CHECK_EQ(last % detail::kStreamIncrement, 0);
+    first /= detail::kStreamIncrement;
+    last /= detail::kStreamIncrement;
+    streams_.insert(first, last);
+  }
+
+  [[nodiscard]] bool contains(StreamId id) const {
+    id -= base_;
+    id /= detail::kStreamIncrement;
+    return streams_.contains(id, id);
+  }
+
+  [[nodiscard]] size_t size() const {
+    size_t ret = 0;
+    for (const auto& [start, end] : streams_) {
+      ret += end - start + 1;
+    }
+    return ret;
+  }
+
+  void clear() {
+    streams_.clear();
+  }
+
+ private:
+  IntervalSet<StreamId, 1, std::vector> streams_;
+  uint8_t base_;
+};
+
 class QuicStreamManager {
  public:
-  explicit QuicStreamManager(
+  QuicStreamManager(
       QuicConnectionStateBase& conn,
       QuicNodeType nodeType,
       const TransportSettings& transportSettings)
@@ -45,6 +100,8 @@ class QuicStreamManager {
       initialLocalUnidirectionalStreamId_ = 0x03;
       initialRemoteBidirectionalStreamId_ = 0x00;
       initialRemoteUnidirectionalStreamId_ = 0x02;
+      peerUnidirectionalStreamGroupsSeen_ = StreamIdSet(0x02);
+      peerBidirectionalStreamGroupsSeen_ = StreamIdSet(0x00);
     } else {
       nextAcceptablePeerBidirectionalStreamId_ = 0x01;
       nextAcceptablePeerUnidirectionalStreamId_ = 0x03;
@@ -56,9 +113,23 @@ class QuicStreamManager {
       initialLocalUnidirectionalStreamId_ = 0x02;
       initialRemoteBidirectionalStreamId_ = 0x01;
       initialRemoteUnidirectionalStreamId_ = 0x03;
+      peerUnidirectionalStreamGroupsSeen_ = StreamIdSet(0x03);
+      peerBidirectionalStreamGroupsSeen_ = StreamIdSet(0x01);
     }
     nextBidirectionalStreamGroupId_ = nextBidirectionalStreamId_;
     nextUnidirectionalStreamGroupId_ = nextUnidirectionalStreamId_;
+    openBidirectionalLocalStreams_ =
+        StreamIdSet(initialLocalBidirectionalStreamId_);
+    openUnidirectionalLocalStreams_ =
+        StreamIdSet(initialLocalUnidirectionalStreamId_);
+    openBidirectionalPeerStreams_ =
+        StreamIdSet(initialRemoteBidirectionalStreamId_);
+    openUnidirectionalPeerStreams_ =
+        StreamIdSet(initialRemoteUnidirectionalStreamId_);
+    openBidirectionalLocalStreamGroups_ =
+        StreamIdSet(nextBidirectionalStreamGroupId_);
+    openUnidirectionalLocalStreamGroups_ =
+        StreamIdSet(nextUnidirectionalStreamGroupId_);
     refreshTransportSettings(transportSettings);
     writeQueue_.setMaxNextsPerStream(
         transportSettings.priorityQueueWritesPerStream);
@@ -68,7 +139,7 @@ class QuicStreamManager {
    * Constructor to facilitate migration of a QuicStreamManager to another
    * QuicConnectionStateBase
    */
-  explicit QuicStreamManager(
+  QuicStreamManager(
       QuicConnectionStateBase& conn,
       QuicNodeType nodeType,
       const TransportSettings& transportSettings,
@@ -121,7 +192,8 @@ class QuicStreamManager {
         std::move(other.openUnidirectionalLocalStreamGroups_);
     newPeerStreams_ = std::move(other.newPeerStreams_);
     newPeerStreamGroups_ = std::move(other.newPeerStreamGroups_);
-    peerStreamGroupsSeen_ = std::move(other.peerStreamGroupsSeen_);
+    peerUnidirectionalStreamGroupsSeen_ =
+        std::move(other.peerUnidirectionalStreamGroupsSeen_);
     newGroupedPeerStreams_ = std::move(other.newGroupedPeerStreams_);
     blockedStreams_ = std::move(other.blockedStreams_);
     stopSendingStreams_ = std::move(other.stopSendingStreams_);
@@ -341,7 +413,8 @@ class QuicStreamManager {
     openUnidirectionalPeerStreams_.clear();
     openBidirectionalLocalStreamGroups_.clear();
     openUnidirectionalLocalStreamGroups_.clear();
-    peerStreamGroupsSeen_.clear();
+    peerUnidirectionalStreamGroupsSeen_.clear();
+    peerBidirectionalStreamGroupsSeen_.clear();
     streams_.clear();
   }
 
@@ -452,7 +525,6 @@ class QuicStreamManager {
       writableStreams_.insert(stream.id);
     }
     if (stream.hasWritableBufMeta()) {
-      LOG(ERROR) << "writable DSR: " << stream.id;
       writableDSRStreams_.insert(stream.id);
     }
     if (!stream.lossBuffer.empty()) {
@@ -765,12 +837,9 @@ class QuicStreamManager {
   /*
    * Consume the flow control updated streams using the parameter vector.
    */
-  auto consumeFlowControlUpdated(std::vector<StreamId>&& storage) {
-    std::vector<StreamId> result = storage;
-    result.clear();
-    result.reserve(flowControlUpdated_.size());
-    result.insert(
-        result.end(), flowControlUpdated_.begin(), flowControlUpdated_.end());
+  std::vector<StreamId> consumeFlowControlUpdated() {
+    std::vector<StreamId> result(
+        flowControlUpdated_.begin(), flowControlUpdated_.end());
     flowControlUpdated_.clear();
     return result;
   }
@@ -864,23 +933,24 @@ class QuicStreamManager {
   /*
    * Consume the new peer streams using the parameter vector.
    */
-  auto consumeNewPeerStreams(std::vector<StreamId>&& storage) {
-    return swapStreams(newPeerStreams_, std::move(storage));
+  std::vector<StreamId> consumeNewPeerStreams() {
+    std::vector<StreamId> res{std::move(newPeerStreams_)};
+    return res;
   }
 
   /*
    * Consume the new peer streams in groups using the parameter vector.
    */
-  auto consumeNewGroupedPeerStreams(std::vector<StreamId>&& storage) {
-    return swapStreams(newGroupedPeerStreams_, std::move(storage));
+  std::vector<StreamId> consumeNewGroupedPeerStreams() {
+    std::vector<StreamId> res{std::move(newGroupedPeerStreams_)};
+    return res;
   }
 
   /*
    * Consume the new peer stream groups using the parameter vector.
    */
   auto consumeNewPeerStreamGroups() {
-    decltype(newPeerStreamGroups_) result;
-    result.swap(newPeerStreamGroups_);
+    decltype(newPeerStreamGroups_) result{std::move(newPeerStreamGroups_)};
     return result;
   }
 
@@ -904,10 +974,8 @@ class QuicStreamManager {
    * Consume the stop sending streams.
    */
   auto consumeStopSending() {
-    std::vector<std::pair<StreamId, ApplicationErrorCode>> result;
-    result.reserve(stopSendingStreams_.size());
-    result.insert(
-        result.end(), stopSendingStreams_.begin(), stopSendingStreams_.end());
+    std::vector<std::pair<const StreamId, const ApplicationErrorCode>> result(
+        stopSendingStreams_.begin(), stopSendingStreams_.end());
     stopSendingStreams_.clear();
     return result;
   }
@@ -994,7 +1062,8 @@ class QuicStreamManager {
   }
 
   [[nodiscard]] size_t getNumPeerStreamGroupsSeen() const {
-    return peerStreamGroupsSeen_.size();
+    return peerUnidirectionalStreamGroupsSeen_.size() +
+        peerBidirectionalStreamGroupsSeen_.size();
   }
 
  private:
@@ -1030,21 +1099,7 @@ class QuicStreamManager {
 
   folly::Expected<StreamGroupId, LocalErrorCode> createNextStreamGroup(
       StreamGroupId& groupId,
-      folly::F14FastSet<StreamGroupId>& streamGroups);
-
-  /*
-   * Helper to consume new stream ids.
-   */
-  std::vector<StreamId> swapStreams(
-      std::vector<StreamId>& src,
-      std::vector<StreamId>&& dst) {
-    std::vector<StreamId> result = dst;
-    result.clear();
-    result.reserve(src.size());
-    result.insert(result.end(), src.begin(), src.end());
-    src.clear();
-    return result;
-  }
+      StreamIdSet& streamGroups);
 
   QuicConnectionStateBase& conn_;
   QuicNodeType nodeType_;
@@ -1108,22 +1163,22 @@ class QuicStreamManager {
   uint64_t numControlStreams_{0};
 
   // Bidirectional streams that are opened by the peer on the connection.
-  folly::F14FastSet<StreamId> openBidirectionalPeerStreams_;
+  StreamIdSet openBidirectionalPeerStreams_;
 
   // Unidirectional streams that are opened by the peer on the connection.
-  folly::F14FastSet<StreamId> openUnidirectionalPeerStreams_;
+  StreamIdSet openUnidirectionalPeerStreams_;
 
   // Bidirectional streams that are opened locally on the connection.
-  folly::F14FastSet<StreamId> openBidirectionalLocalStreams_;
+  StreamIdSet openBidirectionalLocalStreams_;
 
   // Unidirectional streams that are opened locally on the connection.
-  folly::F14FastSet<StreamId> openUnidirectionalLocalStreams_;
+  StreamIdSet openUnidirectionalLocalStreams_;
 
   // Bidirectional stream groupss that are opened locally on the connection.
-  folly::F14FastSet<StreamGroupId> openBidirectionalLocalStreamGroups_;
+  StreamIdSet openBidirectionalLocalStreamGroups_;
 
   // Unidirectional stream groups that are opened locally on the connection.
-  folly::F14FastSet<StreamGroupId> openUnidirectionalLocalStreamGroups_;
+  StreamIdSet openUnidirectionalLocalStreamGroups_;
 
   // A map of streams that are active.
   folly::F14FastMap<StreamId, QuicStreamState> streams_;
@@ -1138,7 +1193,8 @@ class QuicStreamManager {
   folly::F14FastSet<StreamGroupId> newPeerStreamGroups_;
 
   // Peer group ids seen.
-  folly::F14FastSet<StreamGroupId> peerStreamGroupsSeen_;
+  StreamIdSet peerUnidirectionalStreamGroupsSeen_;
+  StreamIdSet peerBidirectionalStreamGroupsSeen_;
 
   // Map of streams that were blocked
   folly::F14FastMap<StreamId, StreamDataBlockedFrame> blockedStreams_;

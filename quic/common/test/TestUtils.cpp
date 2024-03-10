@@ -8,6 +8,7 @@
 #include <quic/common/test/TestUtils.h>
 
 #include <fizz/crypto/test/TestUtil.h>
+#include <fizz/protocol/OpenSSLSelfCertImpl.h>
 #include <fizz/protocol/clock/test/Mocks.h>
 #include <fizz/protocol/test/Mocks.h>
 #include <quic/api/QuicTransportFunctions.h>
@@ -58,7 +59,7 @@ const RegularQuicWritePacket& writeQuicPacket(
 
 PacketNum rstStreamAndSendPacket(
     QuicServerConnectionState& conn,
-    QuicAsyncUDPSocketWrapper& sock,
+    QuicAsyncUDPSocket& sock,
     QuicStreamState& stream,
     ApplicationErrorCode errorCode) {
   auto aead = createNoOpAead();
@@ -115,8 +116,15 @@ static std::shared_ptr<fizz::SelfCert> readCert() {
   auto privKey = fizz::test::getPrivateKey(fizz::test::kP256Key);
   std::vector<folly::ssl::X509UniquePtr> certs;
   certs.emplace_back(std::move(certificate));
-  return std::make_shared<fizz::SelfCertImpl<fizz::KeyType::P256>>(
+  return std::make_shared<fizz::OpenSSLSelfCertImpl<fizz::KeyType::P256>>(
       std::move(privKey), std::move(certs));
+}
+
+std::shared_ptr<fizz::client::FizzClientContext> createClientCtx() {
+  auto clientCtx = std::make_shared<fizz::client::FizzClientContext>();
+  clientCtx->setClock(std::make_shared<NiceMock<fizz::test::MockClock>>());
+  clientCtx->setSupportedAlpns({"quic_test"});
+  return clientCtx;
 }
 
 std::shared_ptr<fizz::server::FizzServerContext> createServerCtx() {
@@ -128,6 +136,7 @@ std::shared_ptr<fizz::server::FizzServerContext> createServerCtx() {
   serverCtx->setCertManager(std::move(certManager));
   serverCtx->setOmitEarlyRecordLayer(true);
   serverCtx->setClock(std::make_shared<NiceMock<fizz::test::MockClock>>());
+  serverCtx->setSupportedAlpns({"quic_test"});
   return serverCtx;
 }
 
@@ -382,47 +391,55 @@ RegularQuicPacketBuilder::Packet createCryptoPacket(
 }
 
 Buf packetToBuf(const RegularQuicPacketBuilder::Packet& packet) {
-  auto packetBuf = packet.header->clone();
-  if (packet.body) {
-    packetBuf->prependChain(packet.body->clone());
+  auto packetBuf = packet.header.clone();
+  if (!packet.body.empty()) {
+    packetBuf->prependChain(packet.body.clone());
   }
   return packetBuf;
 }
 
 Buf packetToBufCleartext(
-    const RegularQuicPacketBuilder::Packet& packet,
+    RegularQuicPacketBuilder::Packet& packet,
     const Aead& cleartextCipher,
     const PacketNumberCipher& headerCipher,
     PacketNum packetNum) {
   VLOG(10) << __func__ << " packet header: "
-           << folly::hexlify(packet.header->clone()->moveToFbString());
-  auto packetBuf = packet.header->clone();
+           << folly::hexlify(packet.header.clone()->moveToFbString());
+  auto packetBuf = packet.header.clone();
   Buf body;
-  if (packet.body) {
-    packet.body->coalesce();
-    body = packet.body->clone();
+  if (!packet.body.empty()) {
+    packet.body.coalesce();
+    body = packet.body.clone();
   } else {
     body = folly::IOBuf::create(0);
   }
   auto headerForm = packet.packet.header.getHeaderForm();
-  packet.header->coalesce();
+  packet.header.coalesce();
   auto tagLen = cleartextCipher.getCipherOverhead();
   if (body->tailroom() < tagLen) {
     body->prependChain(folly::IOBuf::create(tagLen));
   }
   body->coalesce();
   auto encryptedBody = cleartextCipher.inplaceEncrypt(
-      std::move(body), packet.header.get(), packetNum);
+      std::move(body), &packet.header, packetNum);
   encryptedBody->coalesce();
   encryptPacketHeader(
       headerForm,
-      packet.header->writableData(),
-      packet.header->length(),
+      packet.header.writableData(),
+      packet.header.length(),
       encryptedBody->data(),
       encryptedBody->length(),
       headerCipher);
   packetBuf->prependChain(std::move(encryptedBody));
   return packetBuf;
+}
+
+Buf packetToBufCleartext(
+    RegularQuicPacketBuilder::Packet&& packet,
+    const Aead& cleartextCipher,
+    const PacketNumberCipher& headerCipher,
+    PacketNum packetNum) {
+  return packetToBufCleartext(packet, cleartextCipher, headerCipher, packetNum);
 }
 
 uint64_t computeExpectedDelay(
@@ -478,9 +495,11 @@ void updateAckState(
     PacketNum packetNum,
     bool pkHasRetransmittableData,
     bool pkHasCryptoData,
-    TimePoint receivedTime) {
-  uint64_t distance = updateLargestReceivedPacketNum(
-      conn, getAckState(conn, pnSpace), packetNum, receivedTime);
+    TimePoint receiveTimePoint) {
+  ReceivedUdpPacket::Timings packetTimings;
+  packetTimings.receiveTimePoint = receiveTimePoint;
+  uint64_t distance = addPacketToAckState(
+      conn, getAckState(conn, pnSpace), packetNum, packetTimings);
   updateAckSendStateOnRecvPacket(
       conn,
       getAckState(conn, pnSpace),
@@ -720,7 +739,7 @@ writeCryptoFrame(uint64_t offsetIn, Buf data, PacketBuilderInterface& builder) {
 void overridePacketWithToken(
     PacketBuilderInterface::Packet& packet,
     const StatelessResetToken& token) {
-  overridePacketWithToken(*packet.body, token);
+  overridePacketWithToken(packet.body, token);
 }
 
 void overridePacketWithToken(
@@ -770,14 +789,14 @@ bool TestPacketBatchWriter::append(
     std::unique_ptr<folly::IOBuf>&& /*unused*/,
     size_t size,
     const folly::SocketAddress& /*unused*/,
-    QuicAsyncUDPSocketWrapper* /*unused*/) {
+    QuicAsyncUDPSocket* /*unused*/) {
   bufNum_++;
   bufSize_ += size;
   return ((maxBufs_ < 0) || (bufNum_ >= maxBufs_));
 }
 
 ssize_t TestPacketBatchWriter::write(
-    QuicAsyncUDPSocketWrapper& /*unused*/,
+    QuicAsyncUDPSocket& /*unused*/,
     const folly::SocketAddress& /*unused*/) {
   return bufSize_;
 }

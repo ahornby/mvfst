@@ -75,10 +75,11 @@ class ServerHandshakeTest : public Test {
 
   void SetUp() override {
     folly::ssl::init();
-    clientCtx = std::make_shared<fizz::client::FizzClientContext>();
+    // This client context is used outside the context of QUIC in this test, so
+    // we have to manually configure the QUIC record customizations.
+    clientCtx = quic::test::createClientCtx();
     clientCtx->setOmitEarlyRecordLayer(true);
     clientCtx->setFactory(std::make_shared<QuicFizzFactory>());
-    clientCtx->setClock(std::make_shared<fizz::test::MockClock>());
     serverCtx = quic::test::createServerCtx();
     setupClientAndServerContext();
     auto fizzServerContext = FizzServerQuicHandshakeContext::Builder()
@@ -152,18 +153,16 @@ class ServerHandshakeTest : public Test {
     try {
       setHandshakeState();
       waitForData = false;
-      auto writableBytes = getHandshakeWriteBytes();
-      while (writableBytes && !writableBytes->empty() && !waitForData) {
+      do {
+        auto writableBytes = getHandshakeWriteBytes();
+        if (writableBytes->empty()) {
+          break;
+        }
         VLOG(1) << "server->client bytes="
                 << writableBytes->computeChainDataLength();
         clientReadBuffer.append(std::move(writableBytes));
-        if (!clientReadBuffer.empty()) {
-          fizzClient->newTransportData();
-        }
-        if (!waitForData) {
-          writableBytes = getHandshakeWriteBytes();
-        }
-      }
+        fizzClient->newTransportData();
+      } while (!waitForData);
     } catch (const QuicTransportException& e) {
       VLOG(1) << "server exception " << e.what();
       ex = std::make_exception_ptr(e);
@@ -202,24 +201,22 @@ class ServerHandshakeTest : public Test {
     inRoundScope_ = true;
     evb.loop();
     waitForData = false;
-    auto writableBytes = getHandshakeWriteBytes();
-    while (writableBytes && !writableBytes->empty() && !waitForData) {
+    do {
+      auto writableBytes = getHandshakeWriteBytes();
+      if (writableBytes->empty()) {
+        break;
+      }
       VLOG(1) << "server->client bytes="
               << writableBytes->computeChainDataLength();
       clientReadBuffer.append(std::move(writableBytes));
-      if (!clientReadBuffer.empty()) {
-        fizzClient->newTransportData();
-      }
-      if (!waitForData) {
-        writableBytes = getHandshakeWriteBytes();
-      }
-    }
+      fizzClient->newTransportData();
+    } while (!waitForData);
     evb.loop();
   }
 
   void setHandshakeState() {
-    auto oneRttWriteCipherTmp = handshake->getOneRttWriteCipher();
-    auto oneRttReadCipherTmp = handshake->getOneRttReadCipher();
+    auto oneRttWriteCipherTmp = handshake->getFirstOneRttWriteCipher();
+    auto oneRttReadCipherTmp = handshake->getFirstOneRttReadCipher();
     auto zeroRttReadCipherTmp = handshake->getZeroRttReadCipher();
     auto handshakeWriteCipherTmp = std::move(conn->handshakeWriteCipher);
     auto handshakeReadCipherTmp = handshake->getHandshakeReadCipher();
@@ -380,7 +377,7 @@ TEST_F(ServerHandshakeTest, TestHandshakeSuccess) {
     std::rethrow_exception(ex);
   }
   expectOneRttCipher(true);
-  EXPECT_EQ(handshake->getApplicationProtocol(), folly::none);
+  EXPECT_EQ(handshake->getApplicationProtocol(), "quic_test");
   EXPECT_TRUE(handshakeSuccess);
 }
 
@@ -401,7 +398,7 @@ TEST_F(ServerHandshakeTest, TestHandshakeSuccessIgnoreNonHandshake) {
     std::rethrow_exception(ex);
   }
   expectOneRttCipher(true);
-  EXPECT_EQ(handshake->getApplicationProtocol(), folly::none);
+  EXPECT_EQ(handshake->getApplicationProtocol(), "quic_test");
   EXPECT_TRUE(handshakeSuccess);
 }
 
@@ -691,7 +688,7 @@ TEST_F(ServerHandshakeAsyncErrorTest, TestAsyncError) {
   EXPECT_CALL(serverCallback, onCryptoEventAvailable())
       .WillRepeatedly(Invoke([&] {
         try {
-          handshake->getOneRttReadCipher();
+          handshake->getFirstOneRttReadCipher();
         } catch (std::exception&) {
           error = true;
         }
@@ -712,7 +709,7 @@ TEST_F(ServerHandshakeAsyncErrorTest, TestCancelOnAsyncError) {
       }));
   promise.setValue();
   evb.loop();
-  EXPECT_THROW(handshake->getOneRttReadCipher(), std::runtime_error);
+  EXPECT_THROW(handshake->getFirstOneRttReadCipher(), std::runtime_error);
 }
 
 TEST_F(ServerHandshakeAsyncErrorTest, TestCancelWhileWaitingAsyncError) {
@@ -723,7 +720,7 @@ TEST_F(ServerHandshakeAsyncErrorTest, TestCancelWhileWaitingAsyncError) {
 
   promise.setValue();
   evb.loop();
-  EXPECT_THROW(handshake->getOneRttReadCipher(), std::runtime_error);
+  EXPECT_THROW(handshake->getFirstOneRttReadCipher(), std::runtime_error);
 }
 
 class ServerHandshakeSyncErrorTest : public ServerHandshakePskTest {
@@ -742,7 +739,7 @@ TEST_F(ServerHandshakeSyncErrorTest, TestError) {
   // Make an async ticket decryption operation.
   clientServerRound();
   evb.loop();
-  EXPECT_THROW(handshake->getOneRttReadCipher(), std::runtime_error);
+  EXPECT_THROW(handshake->getFirstOneRttReadCipher(), std::runtime_error);
 }
 
 class ServerHandshakeZeroRttDefaultAppTokenValidatorTest

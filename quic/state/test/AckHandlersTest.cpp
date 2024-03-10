@@ -141,7 +141,7 @@ auto getNumAckReceiveTimestamps(const AckEvent& ackEvent) {
 uint64_t buildExpectedReceiveTimestamps(
     const RecvdPacketsTimestampsRange& timestampsRange,
     folly::F14FastMap<PacketNum, uint64_t>& expectedReceiveTimestamps,
-    quic::PacketNum latestReceivedPacketWithAddedGap,
+    quic::PacketNum latestReceivedUdpPacketWithAddedGap,
     uint64_t lastReceiveTimestamp,
     uint64_t maxTimestamps) {
   if (timestampsRange.timestamp_delta_count == 0 ||
@@ -150,7 +150,7 @@ uint64_t buildExpectedReceiveTimestamps(
   }
   auto receiveTimestamp = lastReceiveTimestamp;
   auto receivedPacketNum =
-      latestReceivedPacketWithAddedGap - timestampsRange.gap;
+      latestReceivedUdpPacketWithAddedGap - timestampsRange.gap;
   uint64_t timestampsProcessed = 0;
   for (const auto& delta : timestampsRange.deltas) {
     receiveTimestamp -= delta;
@@ -1635,7 +1635,9 @@ TEST_P(AckHandlersTest, purgeAckReceiveTimestamps) {
     // Fill up the last 25 timestamps ending at PN 40.
     for (PacketNum pktNum = 15; pktNum <= 40; ++pktNum) {
       conn.ackStates.initialAckState->recvdPacketInfos.emplace_back(
-          RecvdPacketInfo{pktNum, expectedTime});
+          WriteAckFrameState::ReceivedPacket{
+              pktNum,
+              ReceivedUdpPacket::Timings{.receiveTimePoint = expectedTime}});
     }
 
     commonAckVisitorForAckFrame(*conn.ackStates.initialAckState, ackFrame);
@@ -1656,7 +1658,9 @@ TEST_P(AckHandlersTest, purgeAckReceiveTimestamps) {
     // Local ACK state has timestamps for {15, 40}
     for (PacketNum pktNum = 15; pktNum <= 40; ++pktNum) {
       conn.ackStates.initialAckState->recvdPacketInfos.emplace_back(
-          RecvdPacketInfo{pktNum, expectedTime});
+          WriteAckFrameState::ReceivedPacket{
+              pktNum,
+              ReceivedUdpPacket::Timings{.receiveTimePoint = expectedTime}});
     }
     // ACK frame in the ACKed packet has ACKs for {10, 20}, {25, 35}
     ackFrame.ackBlocks.emplace_back(10, 20);
@@ -1691,7 +1695,9 @@ TEST_P(AckHandlersTest, purgeAckReceiveTimestamps) {
     // Local ACK state has timestamps for {15, 40}
     for (PacketNum pktNum = 15; pktNum <= 40; ++pktNum) {
       conn.ackStates.initialAckState->recvdPacketInfos.emplace_back(
-          RecvdPacketInfo{pktNum, expectedTime});
+          WriteAckFrameState::ReceivedPacket{
+              pktNum,
+              ReceivedUdpPacket::Timings{.receiveTimePoint = expectedTime}});
     }
     // Selectively ACK some packets in the middle - {18, 20}, {25, 35}
     ackFrame.ackBlocks.emplace_back(25, 35);
@@ -4406,11 +4412,11 @@ class AckEventForAppDataTest : public Test {
   uint64_t getEncodedSize(const RegularQuicPacketBuilder::Packet& packet) {
     // calculate size as the plaintext size
     uint32_t encodedSize = 0;
-    if (packet.header) {
-      encodedSize += packet.header->computeChainDataLength();
+    if (!packet.header.empty()) {
+      encodedSize += packet.header.computeChainDataLength();
     }
-    if (packet.body) {
-      encodedSize += packet.body->computeChainDataLength();
+    if (!packet.body.empty()) {
+      encodedSize += packet.body.computeChainDataLength();
     }
     return encodedSize;
   }
@@ -4418,8 +4424,8 @@ class AckEventForAppDataTest : public Test {
   uint64_t getEncodedBodySize(const RegularQuicPacketBuilder::Packet& packet) {
     // calculate size as the plaintext size
     uint32_t encodedBodySize = 0;
-    if (packet.body) {
-      encodedBodySize += packet.body->computeChainDataLength();
+    if (!packet.body.empty()) {
+      encodedBodySize += packet.body.computeChainDataLength();
     }
     return encodedBodySize;
   }

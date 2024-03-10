@@ -67,7 +67,7 @@ RegularQuicPacketBuilder::Packet createAckPacket(
 
 PacketNum rstStreamAndSendPacket(
     QuicServerConnectionState& conn,
-    QuicAsyncUDPSocketWrapper& sock,
+    QuicAsyncUDPSocket& sock,
     QuicStreamState& stream,
     ApplicationErrorCode errorCode);
 
@@ -119,7 +119,13 @@ RegularQuicPacketBuilder::Packet createCryptoPacket(
 Buf packetToBuf(const RegularQuicPacketBuilder::Packet& packet);
 
 Buf packetToBufCleartext(
-    const RegularQuicPacketBuilder::Packet& packet,
+    RegularQuicPacketBuilder::Packet& packet,
+    const Aead& cleartextCipher,
+    const PacketNumberCipher& headerCipher,
+    PacketNum packetNum);
+
+Buf packetToBufCleartext(
+    RegularQuicPacketBuilder::Packet&& packet,
     const Aead& cleartextCipher,
     const PacketNumberCipher& headerCipher,
     PacketNum packetNum);
@@ -131,6 +137,8 @@ bool isState(const S& s) {
       [](const T&) { return true; },
       [](const auto&) { return false; });
 }
+
+std::shared_ptr<fizz::client::FizzClientContext> createClientCtx();
 
 std::shared_ptr<fizz::server::FizzServerContext> createServerCtx();
 
@@ -207,7 +215,7 @@ void updateAckState(
     PacketNum packetNum,
     bool pkHasRetransmittableData,
     bool pkHasCryptoData,
-    TimePoint receivedTime);
+    TimePoint receiveTimePoint);
 
 template <typename Match>
 OutstandingPacketWrapper* findOutstandingPacket(
@@ -365,10 +373,10 @@ class TestPacketBatchWriter : public IOBufBatchWriter {
       std::unique_ptr<folly::IOBuf>&& /*unused*/,
       size_t size,
       const folly::SocketAddress& /*unused*/,
-      QuicAsyncUDPSocketWrapper* /*unused*/) override;
+      QuicAsyncUDPSocket* /*unused*/) override;
 
   ssize_t write(
-      QuicAsyncUDPSocketWrapper& /*unused*/,
+      QuicAsyncUDPSocket& /*unused*/,
       const folly::SocketAddress& /*unused*/) override;
 
   size_t getBufSize() const {
@@ -527,6 +535,16 @@ class FakeServerHandshake : public FizzServerHandshake {
     }
     oneRttReadCipher_ = createNoOpAead();
     oneRttReadHeaderCipher_ = createNoOpHeaderCipher();
+    readTrafficSecret_ = folly::IOBuf::copyBuffer(getRandSecret());
+    writeTrafficSecret_ = folly::IOBuf::copyBuffer(getRandSecret());
+  }
+
+  std::unique_ptr<Aead> buildAead(folly::ByteRange /*secret*/) override {
+    return createNoOpAead();
+  }
+
+  Buf getNextTrafficSecret(folly::ByteRange /*secret*/) const override {
+    return folly::IOBuf::copyBuffer(getRandSecret());
   }
 
   void setHandshakeKeys() {

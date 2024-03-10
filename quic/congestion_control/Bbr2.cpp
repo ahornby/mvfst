@@ -41,7 +41,10 @@ constexpr float kLossThreshold = 0.02;
 constexpr float kHeadroomFactor = 0.15;
 
 quic::Bandwidth kMinPacingRateForSendQuantum{1200 * 1000, 1s};
-constexpr uint8_t kPacingMarginPercent = 1;
+// The experimental pacer currently achieves ~99% of the target rate
+// we should not reduce the target by adding an extra margin.
+// TODO: add the margin back if the pacer performance improves further.
+constexpr uint8_t kPacingMarginPercent = 0;
 
 Bbr2CongestionController::Bbr2CongestionController(
     QuicConnectionStateBase& conn)
@@ -84,8 +87,9 @@ void Bbr2CongestionController::onPacketSent(
   addAndCheckOverflow(
       conn_.lossState.inflightBytes, packet.metadata.encodedSize);
 
-  // Maintain cwndLimited flag
-  if (conn_.lossState.inflightBytes >= cwndBytes_) {
+  // Maintain cwndLimited flag. We consider the transport being cwnd limited if
+  // we are using > 90% of the cwnd.
+  if (conn_.lossState.inflightBytes > cwndBytes_ * 9 / 10) {
     cwndLimitedInRound_ |= true;
   }
 }
@@ -115,8 +119,7 @@ void Bbr2CongestionController::onPacketAckOrLoss(
             << ")";
   };
 
-  if (lossEvent && lossEvent->lostPackets > 0 &&
-      !conn_.transportSettings.ccaConfig.ignoreLoss) {
+  if (lossEvent && lossEvent->lostPackets > 0) {
     // The pseudo code in BBRHandleLostPacket is included in
     // updateProbeBwCyclePhase. No need to repeat it here.
 
@@ -425,9 +428,6 @@ void Bbr2CongestionController::checkStartupDone() {
   checkStartupHighLoss();
 
   if (state_ == State::Startup && filledPipe_) {
-    if (conn_.transportSettings.ccaConfig.advanceCycleAfterStartup) {
-      cycleCount_++;
-    }
     enterDrain();
   }
 }
@@ -527,9 +527,8 @@ void Bbr2CongestionController::updateProbeBwCyclePhase(
       }
       break;
     case State::ProbeBw_Up:
-
       if (hasElapsedInPhase(minRtt_) &&
-          inflightLatest_ > getTargetInflightWithGain(1.25)) {
+          conn_.lossState.inflightBytes > getTargetInflightWithGain(1.25)) {
         startProbeBwDown();
       }
       break;
@@ -545,14 +544,7 @@ void Bbr2CongestionController::adaptUpperBounds(
     uint64_t ackedBytes,
     uint64_t inflightBytesAtLargestAckedPacket,
     uint64_t lostBytes) {
-  /* Advance probeBw round if necessary and update BBR.max_bw window and
-   * BBR.inflight_hi and BBR.bw_hi. */
-  if (state_ == State::ProbeBw_Down && roundStart_) {
-    /* end of samples from bw probing phase */
-    if (!isAppLimited()) {
-      cycleCount_++;
-    }
-  }
+  /* Update BBR.inflight_hi and BBR.bw_hi. */
 
   if (!checkInflightTooHigh(inflightBytesAtLargestAckedPacket, lostBytes)) {
     if (!inflightHi_.has_value() || !bandwidthHi_.has_value()) {
@@ -830,12 +822,19 @@ void Bbr2CongestionController::startProbeBwDown() {
   /* Decide random round-trip bound for wait: */
   roundsSinceBwProbe_ = folly::Random::rand32() % 2;
   /* Decide the random wall clock bound for wait: between 2-3 seconds */
-  bwProbeWait_ = std::chrono::milliseconds(2 + folly::Random::rand32() % 1000);
+  bwProbeWait_ =
+      std::chrono::milliseconds(2000 + (folly::Random::rand32() % 1000));
 
   probeBWCycleStart_ = Clock::now();
   state_ = State::ProbeBw_Down;
   pacingGain_ = kProbeBwDownPacingGain;
   startRound();
+
+  // This is a new ProbeBW cycle. Advance the max bw filter if we're not app
+  // limited
+  if (!isAppLimited()) {
+    cycleCount_++;
+  }
 }
 void Bbr2CongestionController::startProbeBwCruise() {
   state_ = State::ProbeBw_Cruise;
@@ -912,6 +911,9 @@ Bandwidth Bbr2CongestionController::getBandwidthSampleFromAck(
 }
 
 bool Bbr2CongestionController::isRenoCoexistenceProbeTime() {
+  if (!conn_.transportSettings.ccaConfig.enableRenoCoexistence) {
+    return false;
+  }
   auto renoBdpInPackets = std::min(getTargetInflightWithGain(), cwndBytes_) /
       conn_.udpSendPacketLen;
   auto roundsBeforeRenoProbe =

@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/fizz/server/handshake/AppToken.h>
 #include <quic/server/handshake/TokenGenerator.h>
 #include <quic/server/state/ServerStateMachine.h>
 
@@ -338,16 +339,8 @@ void processClientInitialParams(
     maxUdpPayloadSize = std::min(*packetSize, maxUdpPayloadSize);
     conn.peerMaxUdpPayloadSize = maxUdpPayloadSize;
     if (conn.transportSettings.canIgnorePathMTU) {
-      if (*packetSize > kDefaultMaxUDPPayload) {
-        // A good peer should never set oversized limit, so to be safe we
-        // fallback to default
-        conn.udpSendPacketLen = kDefaultUDPSendPacketLen;
-      } else {
-        // Otherwise, canIgnorePathMTU forces us to immediately set
-        // udpSendPacketLen
-        // TODO: rename "canIgnorePathMTU" to "forciblySetPathMTU"
-        conn.udpSendPacketLen = maxUdpPayloadSize;
-      }
+      *packetSize = std::min<uint64_t>(*packetSize, kDefaultMaxUDPPayload);
+      conn.udpSendPacketLen = *packetSize;
     }
   }
 
@@ -385,9 +378,9 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
   // However, the cipher is only exported to QUIC if early data attempt is
   // accepted. Otherwise, the cipher will be available after cfin is
   // processed.
-  auto oneRttWriteCipher = handshakeLayer->getOneRttWriteCipher();
+  auto oneRttWriteCipher = handshakeLayer->getFirstOneRttWriteCipher();
   // One RTT read cipher is available after cfin is processed.
-  auto oneRttReadCipher = handshakeLayer->getOneRttReadCipher();
+  auto oneRttReadCipher = handshakeLayer->getFirstOneRttReadCipher();
 
   auto oneRttWriteHeaderCipher = handshakeLayer->getOneRttWriteHeaderCipher();
   auto oneRttReadHeaderCipher = handshakeLayer->getOneRttReadHeaderCipher();
@@ -418,6 +411,7 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
           "Duplicate 1-rtt write cipher", TransportErrorCode::CRYPTO_ERROR);
     }
     conn.oneRttWriteCipher = std::move(oneRttWriteCipher);
+    conn.oneRttWritePhase = ProtectionType::KeyPhaseZero;
 
     updatePacingOnKeyEstablished(conn);
 
@@ -439,6 +433,8 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
     conn.isClientAddrVerified = true;
     conn.writableBytesLimit.reset();
     conn.readCodec->setOneRttReadCipher(std::move(oneRttReadCipher));
+    conn.readCodec->setNextOneRttReadCipher(
+        handshakeLayer->getNextOneRttReadCipher());
   }
   auto handshakeReadCipher = handshakeLayer->getHandshakeReadCipher();
   auto handshakeReadHeaderCipher =
@@ -454,6 +450,8 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
     if (!conn.sentHandshakeDone) {
       sendSimpleFrame(conn, HandshakeDoneFrame());
       conn.sentHandshakeDone = true;
+      maybeUpdateTransportFromAppToken(
+          conn, conn.serverHandshakeLayer->getAppToken());
     }
 
     if (!conn.sentNewTokenFrame &&
@@ -535,39 +533,33 @@ void updateWritableByteLimitOnRecvPacket(QuicServerConnectionState& conn) {
   }
 }
 
-void updateTransportParamsFromTicket(
+void maybeUpdateTransportFromAppToken(
     QuicServerConnectionState& conn,
-    uint64_t idleTimeout,
-    uint64_t maxRecvPacketSize,
-    uint64_t initialMaxData,
-    uint64_t initialMaxStreamDataBidiLocal,
-    uint64_t initialMaxStreamDataBidiRemote,
-    uint64_t initialMaxStreamDataUni,
-    uint64_t initialMaxStreamsBidi,
-    uint64_t initialMaxStreamsUni,
-    folly::Optional<uint64_t> maybeCwndHintBytes) {
-  conn.transportSettings.idleTimeout = std::chrono::milliseconds(idleTimeout);
-  conn.transportSettings.maxRecvPacketSize = maxRecvPacketSize;
-
-  conn.transportSettings.advertisedInitialConnectionFlowControlWindow =
-      initialMaxData;
-  conn.transportSettings.advertisedInitialBidiLocalStreamFlowControlWindow =
-      initialMaxStreamDataBidiLocal;
-  conn.transportSettings.advertisedInitialBidiRemoteStreamFlowControlWindow =
-      initialMaxStreamDataBidiRemote;
-  conn.transportSettings.advertisedInitialUniStreamFlowControlWindow =
-      initialMaxStreamDataUni;
-  updateFlowControlStateWithSettings(
-      conn.flowControlState, conn.transportSettings);
-
-  conn.transportSettings.advertisedInitialMaxStreamsBidi =
-      initialMaxStreamsBidi;
-  conn.transportSettings.advertisedInitialMaxStreamsUni = initialMaxStreamsUni;
-
-  conn.maybeCwndHintBytes = maybeCwndHintBytes;
-
+    const folly::Optional<Buf>& tokenBuf) {
+  if (!tokenBuf) {
+    return;
+  }
+  auto appToken = decodeAppToken(*tokenBuf.value());
+  if (!appToken) {
+    VLOG(10) << "Failed to decode app token";
+    return;
+  }
+  auto& params = appToken->transportParams.parameters;
+  auto maybeCwndHintBytes =
+      getIntegerParameter(TransportParameterId::cwnd_hint_bytes, params);
   if (maybeCwndHintBytes) {
     QUIC_STATS(conn.statsCallback, onCwndHintBytesSample, *maybeCwndHintBytes);
+
+    // Only use the cwndHint if the source address is included in the token
+    DCHECK(conn.peerAddress.isInitialized());
+    auto addressMatches =
+        std::find(
+            appToken->sourceAddresses.begin(),
+            appToken->sourceAddresses.end(),
+            conn.peerAddress.getIPAddress()) != appToken->sourceAddresses.end();
+    if (addressMatches) {
+      conn.maybeCwndHintBytes = maybeCwndHintBytes;
+    }
   }
 }
 
@@ -712,7 +704,7 @@ static void handleCipherUnavailable(
         PacketDropReason::PARSE_ERROR_PACKET_BUFFERED);
     ServerEvents::ReadData pendingReadData;
     pendingReadData.peer = readData.peer;
-    pendingReadData.udpPacket = ReceivedPacket(
+    pendingReadData.udpPacket = ReceivedUdpPacket(
         std::move(originalData->packet), readData.udpPacket.timings);
     pendingData->emplace_back(std::move(pendingReadData));
     VLOG(10) << "Adding pending data to "
@@ -805,7 +797,7 @@ void onServerReadDataFromOpen(
     CHECK(newServerConnIdData.has_value());
     conn.serverConnectionId = newServerConnIdData->connId;
 
-    auto customTransportParams = setSupportedExtensionTransportParameters(conn);
+    auto customTransportParams = getSupportedExtTransportParams(conn);
 
     QUIC_STATS(conn.statsCallback, onStatelessReset);
     conn.serverHandshakeLayer->accept(
@@ -831,6 +823,7 @@ void onServerReadDataFromOpen(
     const CryptoFactory& cryptoFactory =
         conn.serverHandshakeLayer->getCryptoFactory();
     conn.readCodec = std::make_unique<QuicReadCodec>(QuicNodeType::Server);
+    conn.readCodec->setConnectionStatsCallback(conn.statsCallback);
     conn.readCodec->setInitialReadCipher(cryptoFactory.getClientInitialCipher(
         initialDestinationConnectionId, version));
     conn.readCodec->setClientConnectionId(clientConnectionId);
@@ -1019,12 +1012,12 @@ void onServerReadDataFromOpen(
     }
 
     auto& ackState = getAckState(conn, packetNumberSpace);
-    uint64_t distanceFromExpectedPacketNum = updateLargestReceivedPacketNum(
-        conn, ackState, packetNum, readData.udpPacket.timings.receiveTimePoint);
+    uint64_t distanceFromExpectedPacketNum = addPacketToAckState(
+        conn, ackState, packetNum, readData.udpPacket.timings);
     if (distanceFromExpectedPacketNum > 0) {
       QUIC_STATS(conn.statsCallback, onOutOfOrderPacketReceived);
     }
-    DCHECK(hasReceivedPackets(conn));
+    DCHECK(hasReceivedUdpPackets(conn));
 
     bool pktHasRetransmittableData = false;
     bool pktHasCryptoData = false;
@@ -1042,9 +1035,12 @@ void onServerReadDataFromOpen(
               conn,
               packetNumberSpace,
               ackFrame,
-              [&](const OutstandingPacketWrapper&,
+              [&](const OutstandingPacketWrapper& outstandingPacket,
                   const QuicWriteFrame& packetFrame,
                   const ReadAckFrame&) {
+                maybeVerifyPendingKeyUpdate(
+                    conn, outstandingPacket, regularPacket);
+
                 switch (packetFrame.type()) {
                   case QuicWriteFrame::Type::WriteStreamFrame: {
                     const WriteStreamFrame& frame =
@@ -1299,6 +1295,8 @@ void onServerReadDataFromOpen(
       handshakeConfirmed(conn);
     }
 
+    maybeHandleIncomingKeyUpdate(conn);
+
     // Update writable limit before processing the handshake data. This is so
     // that if we haven't decided whether or not to validate the peer, we won't
     // increase the limit.
@@ -1496,6 +1494,8 @@ void onServerReadDataFromClosed(
     conn.qLogger->addPacket(regularPacket, packetSize);
   }
 
+  // TODO: Should we honor a key update from the peer on a closed connection?
+
   // Only process the close frames in the packet
   for (auto& quicFrame : regularPacket.frames) {
     switch (quicFrame.type()) {
@@ -1572,50 +1572,5 @@ QuicServerConnectionState::createAndAddNewSelfConnId() {
   newConnIdData.token = generator.generateToken(newConnIdData.connId);
   selfConnectionIds.push_back(newConnIdData);
   return newConnIdData;
-}
-
-std::vector<TransportParameter> setSupportedExtensionTransportParameters(
-    QuicServerConnectionState& conn) {
-  using TpId = TransportParameterId;
-  std::vector<TransportParameter> customTps;
-  const auto& ts = conn.transportSettings;
-
-  if (ts.datagramConfig.enabled) {
-    customTps.push_back(encodeIntegerParameter(
-        TransportParameterId::max_datagram_frame_size,
-        conn.datagramState.maxReadFrameSize));
-  }
-
-  if (ts.advertisedMaxStreamGroups > 0) {
-    customTps.push_back(encodeIntegerParameter(
-        TpId::stream_groups_enabled, ts.advertisedMaxStreamGroups));
-  }
-
-  customTps.push_back(encodeIntegerParameter(
-      TpId::ack_receive_timestamps_enabled,
-      ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value() ? 1 : 0));
-
-  if (ts.maybeAckReceiveTimestampsConfigSentToPeer.has_value()) {
-    customTps.push_back(encodeIntegerParameter(
-        TpId::max_receive_timestamps_per_ack,
-        ts.maybeAckReceiveTimestampsConfigSentToPeer
-            ->maxReceiveTimestampsPerAck));
-
-    customTps.push_back(encodeIntegerParameter(
-        TpId::receive_timestamps_exponent,
-        ts.maybeAckReceiveTimestampsConfigSentToPeer
-            ->receiveTimestampsExponent));
-  }
-
-  if (ts.minAckDelay) {
-    customTps.push_back(encodeIntegerParameter(
-        TpId::min_ack_delay, ts.minAckDelay.value().count()));
-  }
-
-  if (ts.advertisedKnobFrameSupport) {
-    customTps.push_back(encodeIntegerParameter(TpId::knob_frames_supported, 1));
-  }
-
-  return customTps;
 }
 } // namespace quic

@@ -15,8 +15,8 @@
 
 #include <utility>
 
-namespace folly {
-class EventBase;
+namespace quic {
+class QuicEventBase;
 }
 
 namespace quic {
@@ -58,9 +58,8 @@ class SocketObserverInterface {
     // mvfst currently supports C++17 onwards. However, we can enable this for
     // unit tests and other code that we expect to run in C++20.
 #if FOLLY_CPLUSPLUS >= 202002L
-    friend auto operator<=>(
-        const CloseStartedEvent&,
-        const CloseStartedEvent&) = default;
+    friend bool operator==(const CloseStartedEvent&, const CloseStartedEvent&) =
+        default;
 #elif _WIN32
     friend auto operator!=(
         const CloseStartedEvent& right,
@@ -222,7 +221,7 @@ class SocketObserverInterface {
     /**
      * Packet received.
      */
-    struct ReceivedPacket {
+    struct ReceivedUdpPacket {
       // Packet receive timestamp.
       //
       // If socket receive (RX) timestamps are used this will be the timestamp
@@ -242,12 +241,12 @@ class SocketObserverInterface {
       struct Builder : public BuilderFields {
         Builder&& setPacketReceiveTime(const TimePoint packetReceiveTimeIn);
         Builder&& setPacketNumBytes(const uint64_t packetNumBytesIn);
-        ReceivedPacket build() &&;
+        ReceivedUdpPacket build() &&;
         explicit Builder() = default;
       };
 
       // Use builder to construct.
-      explicit ReceivedPacket(BuilderFields&& builderFields);
+      explicit ReceivedUdpPacket(BuilderFields&& builderFields);
     };
 
     // Receive loop timestamp.
@@ -260,13 +259,13 @@ class SocketObserverInterface {
     const uint64_t numBytesReceived;
 
     // Details for each received packet.
-    std::vector<ReceivedPacket> receivedPackets;
+    std::vector<ReceivedUdpPacket> receivedPackets;
 
     struct BuilderFields {
       folly::Optional<TimePoint> maybeReceiveLoopTime;
       folly::Optional<uint64_t> maybeNumPacketsReceived;
       folly::Optional<uint64_t> maybeNumBytesReceived;
-      std::vector<ReceivedPacket> receivedPackets;
+      std::vector<ReceivedUdpPacket> receivedPackets;
       explicit BuilderFields() = default;
     };
 
@@ -274,7 +273,7 @@ class SocketObserverInterface {
       Builder&& setReceiveLoopTime(const TimePoint receiveLoopTimeIn);
       Builder&& setNumPacketsReceived(const uint64_t numPacketsReceivedIn);
       Builder&& setNumBytesReceived(const uint64_t numBytesReceivedIn);
-      Builder&& addReceivedPacket(ReceivedPacket&& packetIn);
+      Builder&& addReceivedUdpPacket(ReceivedUdpPacket&& packetIn);
       PacketsReceivedEvent build() &&;
       explicit Builder() = default;
     };
@@ -457,7 +456,7 @@ class SocketObserverInterface {
    */
   virtual void evbAttach(
       QuicSocket* /* socket */,
-      folly::EventBase* /* evb */) noexcept {}
+      QuicEventBase* /* evb */) noexcept {}
 
   /**
    * evbDetach() will be invoked when an existing event base is detached
@@ -468,7 +467,7 @@ class SocketObserverInterface {
    */
   virtual void evbDetach(
       QuicSocket* /* socket */,
-      folly::EventBase* /* evb */) noexcept {}
+      QuicEventBase* /* evb */) noexcept {}
 
   /**
    * startWritingFromAppLimited() is invoked when the socket is currently

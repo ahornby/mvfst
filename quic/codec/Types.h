@@ -19,6 +19,7 @@
 #include <quic/common/BufUtil.h>
 #include <quic/common/CircularDeque.h>
 #include <quic/common/IntervalSet.h>
+#include <quic/common/NetworkData.h>
 #include <quic/common/SmallCollections.h>
 #include <quic/common/Variant.h>
 
@@ -30,7 +31,7 @@
 namespace quic {
 
 using StreamId = uint64_t;
-using StreamGroupId = uint64_t;
+using StreamGroupId = StreamId;
 
 enum class PacketNumberSpace : uint8_t {
   Initial,
@@ -49,14 +50,6 @@ constexpr auto kNumInitialAckBlocksPerFrame = 32;
 template <class T>
 using IntervalSetVec = SmallVec<T, kNumInitialAckBlocksPerFrame>;
 using AckBlocks = IntervalSet<PacketNum, 1, IntervalSetVec>;
-
-/**
- * Info stored on receipt of a packet for use in subsequent ACK.
- */
-struct RecvdPacketInfo {
-  PacketNum pktNum;
-  TimePoint timeStamp;
-};
 
 struct PaddingFrame {
   // How many contiguous padding frames this represents.
@@ -222,6 +215,14 @@ struct WriteAckFrame {
 };
 
 struct WriteAckFrameState {
+  /**
+   * Info stored on receipt of a packet for use in subsequent ACK.
+   */
+  struct ReceivedPacket {
+    PacketNum pktNum;
+    ReceivedUdpPacket::Timings timings;
+  };
+
   AckBlocks acks;
 
   // Receive timestamp and packet number for the largest received packet.
@@ -229,14 +230,15 @@ struct WriteAckFrameState {
   // Updated whenever we receive a packet with a larger packet number
   // than all previously received packets in the packet number space
   // tracked by this AckState.
-  folly::Optional<RecvdPacketInfo> largestRecvdPacketInfo;
+  folly::Optional<ReceivedPacket> largestRecvdPacketInfo;
+
   // Receive timestamp and packet number for the last received packet.
   //
   // Will be different from the value stored in largestRecvdPacketInfo
   // if the last packet was received out of order and thus had a packet
   // number less than that of a previously received packet in the packet
   // number space tracked by this AckState.
-  folly::Optional<RecvdPacketInfo> lastRecvdPacketInfo;
+  folly::Optional<ReceivedPacket> lastRecvdPacketInfo;
 
   // Packet number and timestamp of recently received packets.
   //
@@ -248,7 +250,7 @@ struct WriteAckFrameState {
   // if the packet number is greater than the packet number of the last
   // element in the deque (e.g., entries are not added for packets that
   // arrive out of order relative to previously received packets).
-  CircularDeque<RecvdPacketInfo> recvdPacketInfos;
+  CircularDeque<ReceivedPacket> recvdPacketInfos;
 };
 
 struct WriteAckFrameMetaData {
@@ -1030,7 +1032,7 @@ struct ShortHeader {
   bool readInitialByte(uint8_t initalByte);
   bool readConnectionId(folly::io::Cursor& cursor);
   bool readPacketNum(
-      PacketNum largestReceivedPacketNum,
+      PacketNum largestReceivedUdpPacketNum,
       folly::io::Cursor& cursor);
 
  private:
@@ -1153,16 +1155,17 @@ struct RegularPacket {
 };
 
 struct RetryPacket {
+  using IntegrityTagType = std::array<uint8_t, kRetryIntegrityTagLen>;
   RetryPacket(
       LongHeader&& longHeaderIn,
-      Buf integrityTagIn,
+      IntegrityTagType integrityTagIn,
       uint8_t initialByteIn)
       : header(std::move(longHeaderIn)),
-        integrityTag(std::move(integrityTagIn)),
+        integrityTag(integrityTagIn),
         initialByte(initialByteIn) {}
 
   LongHeader header;
-  Buf integrityTag;
+  std::array<uint8_t, kRetryIntegrityTagLen> integrityTag;
   uint8_t initialByte;
 };
 

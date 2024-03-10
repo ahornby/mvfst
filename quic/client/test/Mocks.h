@@ -13,7 +13,8 @@
 #include <quic/client/handshake/CachedServerTransportParameters.h>
 #include <quic/client/handshake/ClientHandshake.h>
 #include <quic/client/handshake/ClientHandshakeFactory.h>
-#include <quic/common/QuicAsyncUDPSocketWrapper.h>
+#include <quic/common/events/FollyQuicEventBase.h>
+#include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/handshake/CryptoFactory.h>
 #include <quic/handshake/TransportParameters.h>
 
@@ -54,6 +55,13 @@ class MockClientHandshake : public ClientHandshake {
   MOCK_METHOD(void, removePsk, (const folly::Optional<std::string>&));
   MOCK_METHOD(const CryptoFactory&, getCryptoFactory, (), (const));
   MOCK_METHOD(bool, isTLSResumed, (), (const));
+  MOCK_METHOD(
+      std::unique_ptr<std::vector<unsigned char>>,
+      getExportedKeyingMaterial,
+      (const std::string& label,
+       const std::vector<unsigned char>* context,
+       uint16_t keyLength),
+      ());
   MOCK_METHOD(folly::Optional<bool>, getZeroRttRejected, ());
   MOCK_METHOD(
       const folly::Optional<ServerTransportParameters>&,
@@ -69,9 +77,14 @@ class MockClientHandshake : public ClientHandshake {
   MOCK_METHOD(void, processSocketData, (folly::IOBufQueue & queue));
   MOCK_METHOD(bool, matchEarlyParameters, ());
   MOCK_METHOD(
-      (std::pair<std::unique_ptr<Aead>, std::unique_ptr<PacketNumberCipher>>),
-      buildCiphers,
+      std::unique_ptr<Aead>,
+      buildAead,
       (ClientHandshake::CipherKind kind, folly::ByteRange secret));
+  MOCK_METHOD(
+      std::unique_ptr<PacketNumberCipher>,
+      buildHeaderCipher,
+      (folly::ByteRange secret));
+  MOCK_METHOD(Buf, getNextTrafficSecret, (folly::ByteRange secret), (const));
   MOCK_METHOD(
       const folly::Optional<std::string>&,
       getApplicationProtocol,
@@ -91,8 +104,8 @@ class MockQuicClientTransport : public quic::QuicClientTransport {
 
   explicit MockQuicClientTransport(
       TestType testType,
-      folly::EventBase* evb,
-      std::unique_ptr<QuicAsyncUDPSocketWrapper> socket,
+      std::shared_ptr<QuicEventBase> evb,
+      std::unique_ptr<QuicAsyncUDPSocket> socket,
       std::shared_ptr<ClientHandshakeFactory> handshakeFactory)
       : QuicClientTransport(
             evb,
